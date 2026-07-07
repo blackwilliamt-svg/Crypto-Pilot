@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CryptoPilot — Paper Trading Bot</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">◆</span>
+    <h1>CryptoPilot</h1>
+    <span class="paper-badge">PAPER TRADING</span>
+  </div>
+  <div class="header-stats">
+    <div class="hstat"><span class="hstat-label">Equity</span><span id="h-equity" class="hstat-value">—</span></div>
+    <div class="hstat"><span class="hstat-label">Total P&amp;L</span><span id="h-pnl" class="hstat-value">—</span></div>
+    <div id="status-pill" class="status-pill starting"><span class="dot"></span><span id="status-text">STARTING</span></div>
+    <button id="btn-pause" class="btn">Pause</button>
+    <button id="btn-reset" class="btn btn-danger">Reset</button>
+  </div>
+</header>
+
+<main>
+  <div id="loading" class="loading-banner">Bot warming up — fetching market data and headlines (first cycle takes ~15s)…</div>
+  <div id="error-banner" class="error-banner hidden"></div>
+
+  <div class="grid grid-2">
+    <section class="card">
+      <div class="card-head"><h2>🧠 Bot Findings</h2><span id="summary-time" class="muted"></span></div>
+      <div id="summary-bias" class="bias-line"></div>
+      <ul id="summary-lines" class="summary-list"></ul>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>💼 Portfolio</h2><canvas id="spark" width="260" height="56"></canvas></div>
+      <div class="port-stats" id="port-stats"></div>
+      <table class="table" id="positions-table">
+        <thead><tr><th>Coin</th><th>Qty</th><th>Entry</th><th>Now</th><th>Value</th><th>P&amp;L</th><th>Stop / Target</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="positions-empty" class="empty hidden">No open positions — the bot is waiting for a strong enough signal.</div>
+    </section>
+  </div>
+
+  <section class="card">
+    <div class="card-head"><h2>📡 Signals &amp; Potential Trades</h2><span class="muted">click a row for the chart · TA 65% + news 35%</span></div>
+    <table class="table" id="signals-table">
+      <thead><tr>
+        <th>Coin</th><th>Price</th><th>24h</th><th>Technical</th><th>News</th>
+        <th>Combined</th><th>Signal</th><th>Bot action</th><th>Key factors</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <div class="grid grid-2">
+    <section class="card">
+      <div class="card-head"><h2>🧾 Recent Trades</h2></div>
+      <div class="scroll-box">
+        <table class="table" id="trades-table">
+          <thead><tr><th>Time</th><th>Side</th><th>Coin</th><th>Price</th><th>Value</th><th>P&amp;L</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div id="trades-empty" class="empty hidden">No trades yet.</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>📰 Headlines</h2><span id="news-count" class="muted"></span></div>
+      <div class="scroll-box" id="headlines"></div>
+    </section>
+  </div>
+
+  <footer>
+    Paper trading only — no real funds are used. Market data: Kraken public API · Headlines: public RSS feeds.
+    Signals are experimental and not financial advice.
+  </footer>
+</main>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2 id="modal-title">—</h2>
+      <div id="modal-chips" class="chips"></div>
+      <button id="modal-close" class="btn">✕</button>
+    </div>
+    <canvas id="chart" width="860" height="380"></canvas>
+    <div class="legend">
+      <span><i class="sw" style="background:#38bdf8"></i>Price</span>
+      <span><i class="sw" style="background:#a78bfa"></i>EMA 20</span>
+      <span><i class="sw" style="background:#fbbf24"></i>EMA 50</span>
+      <span><i class="sw" style="background:rgba(56,189,248,.16)"></i>Bollinger band</span>
+      <span><i class="sw tri-up"></i>Buy</span>
+      <span><i class="sw tri-dn"></i>Sell</span>
+    </div>
+    <ul id="modal-reasons" class="summary-list"></ul>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
