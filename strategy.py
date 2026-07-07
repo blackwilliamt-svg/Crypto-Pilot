@@ -1,9 +1,13 @@
-"""Combine technical + news scores into one signal and classify it."""
+"""Combine technical + news scores into one signal and classify it.
 
-TA_WEIGHT = 0.65
-NEWS_WEIGHT = 0.35
-BUY_THRESHOLD = 30.0
-SELL_THRESHOLD = -25.0
+Aggressive profile: lower entry bar, quicker bearish exits, TA weighted
+heavier than news since the primary signal now runs on 15-minute candles.
+"""
+
+TA_WEIGHT = 0.70
+NEWS_WEIGHT = 0.30
+BUY_THRESHOLD = 24.0
+SELL_THRESHOLD = -18.0
 
 
 def combine(ta_score: float, news_score: float) -> float:
@@ -11,16 +15,16 @@ def combine(ta_score: float, news_score: float) -> float:
 
 
 def classify(total: float) -> str:
-    if total >= 55:
+    if total >= 48:
         return "STRONG BUY"
     if total >= BUY_THRESHOLD:
         return "BUY"
-    if total >= 12:
+    if total >= 10:
         return "WATCH"
-    if total <= -50:
+    if total <= -45:
         return "STRONG SELL"
     if total <= SELL_THRESHOLD:
         return "SELL"
-    if total <= -12:
+    if total <= -10:
         return "CAUTION"
     return "NEUTRAL"

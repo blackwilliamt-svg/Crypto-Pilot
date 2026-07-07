@@ -134,7 +134,7 @@ def coin_sentiment(headlines: list[dict], symbol: str) -> dict:
     def agg(items):
         num = den = 0.0
         for h in items:
-            w = 0.5 ** ((now - h["ts"]) / 3600.0 / 12.0)  # 12h half-life
+            w = 0.5 ** ((now - h["ts"]) / 3600.0 / 8.0)  # 8h half-life — reacts faster to fresh news
             num += h["sentiment"] * w
             den += w
         return (num / den) if den else 0.0

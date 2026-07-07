@@ -24,17 +24,24 @@ candle fetches.
 Kraken provides prices, so the tradable set is their intersection, capped at 150
 coins by market cap). Typically ~100-150 coins.
 
-Each cycle, for every coin in the universe:
+Each cycle (every 45 seconds), for every coin in the universe:
 
-1. **Technical score (65% weight)** from hourly Kraken candles:
+1. **Technical score (70% weight)** from 15-minute Kraken candles:
    RSI(14) overbought/oversold, MACD(12,26,9) crossovers and momentum,
-   EMA20/EMA50 trend, Bollinger band position, 10-hour rate of change.
-2. **News score (35% weight)**: headlines from CoinDesk, Cointelegraph, Decrypt,
+   EMA20/EMA50 trend, Bollinger band position, 2.5-hour rate of change —
+   then adjusted up to ±15 points by trend alignment on the higher
+   timeframes (1h 50% / 4h 30% / 1d 20%), so trades with the larger trend
+   get boosted and counter-trend setups get penalized.
+2. **News score (30% weight)**: headlines from CoinDesk, Cointelegraph, Decrypt,
    CryptoSlate, and Bitcoin Magazine RSS feeds are scored with a bullish/bearish
-   keyword lexicon, matched to coins, and recency-weighted (12-hour half-life).
+   keyword lexicon, matched to coins, and recency-weighted (8-hour half-life).
    Market-wide news bleeds into every coin at reduced weight.
-3. **Combined signal** (−100…+100): ≥ +30 opens a position (max 5, ~18% of equity each),
-   ≤ −25 closes one. Every position also carries a −5% stop-loss and +12% take-profit.
+3. **Combined signal** (−100…+100): ≥ +24 opens a position (max 8, ~12% of equity
+   each), ≤ −18 closes one. Stops and targets are adaptive: sized off each coin's
+   hourly ATR (stop 1.8×, target 2.8×, max risk −10%), with the stop trailing
+   price upward chandelier-style (only ever tightens) and the target extending
+   while the trend holds. A 30-minute re-entry cooldown per coin prevents
+   fast-signal churn.
 
 Every trade is logged with the reasoning behind it, and the dashboard's **Bot Findings**
 panel summarizes the current market read, strongest/weakest setups, news flow, and

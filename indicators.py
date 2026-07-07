@@ -62,8 +62,41 @@ def roc(closes: list[float], n: int = 10) -> float:
     return (closes[-1] / closes[-1 - n] - 1.0) * 100.0
 
 
-def analyze(candles: list[dict]) -> dict:
-    """Score a coin from its hourly candles. Positive = bullish."""
+def atr(candles: list[dict], period: int = 14) -> float:
+    """Average True Range (Wilder-smoothed) — used to size stops/targets to
+    each coin's own volatility instead of a one-size-fits-all percentage."""
+    if len(candles) <= period:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["h"], candles[i]["l"], candles[i - 1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    avg = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        avg = (avg * (period - 1) + tr) / period
+    return avg
+
+
+def trend_bias(candles: list[dict]) -> float:
+    """Directional bias (-1..+1) for a higher timeframe (4h/1d), from EMA20 vs
+    EMA50 and RSI regime. Cheaper than a full analyze() — used only to
+    confirm/veto the primary hourly signal, not as a standalone score."""
+    closes = [c["c"] for c in candles]
+    if len(closes) < 55:
+        return 0.0
+    e20, e50 = ema_series(closes, 20), ema_series(closes, 50)
+    r = rsi(closes)
+    bias = 0.6 if e20[-1] > e50[-1] else -0.6
+    if r >= 55:
+        bias += 0.4
+    elif r <= 45:
+        bias -= 0.4
+    return max(-1.0, min(1.0, bias))
+
+
+def analyze(candles: list[dict], bars_per_hour: int = 1) -> dict:
+    """Score a coin from its candles (any timeframe; pass bars_per_hour so
+    fixed-hour stats like 24h change stay correct). Positive = bullish."""
     closes = [c["c"] for c in candles]
     price = closes[-1]
     reasons: list[str] = []
@@ -74,7 +107,8 @@ def analyze(candles: list[dict]) -> dict:
     e20, e50 = ema_series(closes, 20), ema_series(closes, 50)
     _, _, _, pct_b = bollinger(closes)
     momentum = roc(closes, 10)
-    change24 = (price / closes[-25] - 1.0) * 100.0 if len(closes) > 25 else 0.0
+    n24 = 24 * bars_per_hour
+    change24 = (price / closes[-(n24 + 1)] - 1.0) * 100.0 if len(closes) > n24 else 0.0
 
     if r <= 30:
         score += 25; reasons.append(f"RSI {r:.0f} oversold — bounce setup")
@@ -88,9 +122,9 @@ def analyze(candles: list[dict]) -> dict:
     cross_up = any(hist[i] <= 0 < hist[i + 1] for i in range(-4, -1))
     cross_dn = any(hist[i] >= 0 > hist[i + 1] for i in range(-4, -1))
     if cross_up:
-        score += 20; reasons.append("MACD bullish crossover (last few hours)")
+        score += 20; reasons.append("MACD bullish crossover (recent bars)")
     elif cross_dn:
-        score -= 20; reasons.append("MACD bearish crossover (last few hours)")
+        score -= 20; reasons.append("MACD bearish crossover (recent bars)")
     elif hist[-1] > 0 and hist[-1] > hist[-2]:
         score += 12; reasons.append("MACD momentum positive and building")
     elif hist[-1] > 0:
@@ -113,7 +147,8 @@ def analyze(candles: list[dict]) -> dict:
 
     score += max(-12.0, min(12.0, momentum * 1.5))
     if abs(momentum) >= 2:
-        reasons.append(f"10h momentum {momentum:+.1f}%")
+        mom_hours = 10 / bars_per_hour
+        reasons.append(f"{mom_hours:g}h momentum {momentum:+.1f}%")
 
     return {
         "price": price,

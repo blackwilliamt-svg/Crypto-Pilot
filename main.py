@@ -17,13 +17,21 @@ import indicators
 import market
 import news
 import strategy
-from trader import PaperTrader, STOP_LOSS, TAKE_PROFIT, MAX_POSITIONS, MIN_TRADE_CASH, START_CASH
+from trader import PaperTrader, MAX_POSITIONS, MIN_TRADE_CASH, START_CASH
 
 ROOT = Path(__file__).parent
-CYCLE_SECONDS = 75
+CYCLE_SECONDS = 45  # aggressive: re-evaluate faster now that the signal runs on 15m candles
 NEWS_REFRESH_SECONDS = 300
 UNIVERSE_REFRESH_SECONDS = 6 * 3600
-CANDLE_HISTORY_LIMIT = 750  # ~31 days hourly — enough headroom for every indicator + 7d chart
+CANDLE_HISTORY_LIMIT = 750  # per store: ~8 days of 15m, ~31 days of 1h, ~4 months of 4h
+
+# The tactical signal runs on 15m candles (refreshed every cycle). The 1h/4h/1d
+# stores provide trend context on progressively slower refresh cadences —
+# higher timeframes change slowly, so refetching them every 45s cycle would
+# multiply Kraken call volume for no benefit.
+TIMEFRAME_1H_REFRESH_SECONDS = 300
+TIMEFRAME_4H_REFRESH_SECONDS = 900
+TIMEFRAME_1D_REFRESH_SECONDS = 3600
 
 @asynccontextmanager
 async def _lifespan(app):
@@ -37,11 +45,17 @@ app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 LOCK = threading.Lock()
 STATE: dict = {"status": "starting", "error": None}
 UNIVERSE: dict[str, dict] = {}
-CANDLES: dict[str, list[dict]] = {}
+CANDLES_15M: dict[str, list[dict]] = {}   # 15m — primary tactical signal
+CANDLES: dict[str, list[dict]] = {}       # 1h — trend context + charts + ATR for stops
+CANDLES_4H: dict[str, list[dict]] = {}    # 4h — medium-term trend context
+CANDLES_1D: dict[str, list[dict]] = {}    # 1d — long-term trend context
 HEADLINES: list[dict] = []
 NEWS_PATTERNS: dict[str, tuple] = {}
 _last_news = 0.0
 _last_universe = 0.0
+_last_1h = 0.0
+_last_4h = 0.0
+_last_1d = 0.0
 PAUSED = False
 TRADER = PaperTrader(str(ROOT / "cryptopilot.db"))
 
@@ -52,18 +66,21 @@ def _refresh_universe():
     if fresh:
         UNIVERSE = fresh
         NEWS_PATTERNS = news.build_coin_patterns(UNIVERSE)
-        for sym in list(CANDLES):
-            if sym not in UNIVERSE:
-                del CANDLES[sym]
+        for store in (CANDLES_15M, CANDLES, CANDLES_4H, CANDLES_1D):
+            for sym in list(store):
+                if sym not in UNIVERSE:
+                    del store[sym]
     _last_universe = time.time()
 
 
-def _refresh_candles():
+def _refresh_candle_store(store: dict[str, list[dict]], interval: int):
+    """Incremental refresh: fetch only candles newer than what's already held,
+    for every coin in the universe, at the given Kraken interval (minutes)."""
     for sym, meta in UNIVERSE.items():
-        existing = CANDLES.get(sym, [])
+        existing = store.get(sym, [])
         since = existing[-1]["t"] if existing else None
         try:
-            new_rows = market.fetch_ohlc(meta["pair"], since=since)
+            new_rows = market.fetch_ohlc(meta["pair"], interval=interval, since=since)
         except Exception:
             new_rows = []
         if new_rows:
@@ -72,9 +89,13 @@ def _refresh_candles():
                 merged = existing + [r for r in new_rows if r["t"] not in existing_ts]
             else:
                 merged = new_rows
-            CANDLES[sym] = merged[-CANDLE_HISTORY_LIMIT:]
+            store[sym] = merged[-CANDLE_HISTORY_LIMIT:]
         time.sleep(0.25)  # stay well under Kraken's public rate limit
-    if not CANDLES:
+
+
+def _refresh_candles():
+    _refresh_candle_store(CANDLES_15M, 15)
+    if not CANDLES_15M:
         raise RuntimeError("Could not fetch market data from Kraken")
 
 
@@ -121,29 +142,54 @@ def _build_summary(signals, actions, prices, headlines):
 
 
 def _cycle():
-    global STATE
+    global STATE, _last_1h, _last_4h, _last_1d
     if not UNIVERSE or time.time() - _last_universe > UNIVERSE_REFRESH_SECONDS:
         _refresh_universe()
     _refresh_candles()
+    if time.time() - _last_1h > TIMEFRAME_1H_REFRESH_SECONDS:
+        _refresh_candle_store(CANDLES, 60)
+        _last_1h = time.time()
+    if time.time() - _last_4h > TIMEFRAME_4H_REFRESH_SECONDS:
+        _refresh_candle_store(CANDLES_4H, 240)
+        _last_4h = time.time()
+    if time.time() - _last_1d > TIMEFRAME_1D_REFRESH_SECONDS:
+        _refresh_candle_store(CANDLES_1D, 1440)
+        _last_1d = time.time()
     if time.time() - _last_news > NEWS_REFRESH_SECONDS:
         _refresh_news()
 
     headlines = HEADLINES
-    prices, signals = {}, []
+    prices, atrs, signals = {}, {}, []
     for sym, meta in UNIVERSE.items():
-        candles = CANDLES.get(sym)
+        candles = CANDLES_15M.get(sym)
         if not candles or len(candles) < 60:
             continue
-        ta = indicators.analyze(candles)
+        ta = indicators.analyze(candles, bars_per_hour=4)
+        # Stops/targets are sized off hourly ATR — structural volatility —
+        # not the noisy 15m bars the tactical signal runs on.
+        atrs[sym] = indicators.atr(CANDLES.get(sym, []))
+
+        # Trend context from 1h/4h/1d candles: confirms or penalizes the
+        # primary 15m signal rather than standing alone.
+        bias_1h = indicators.trend_bias(CANDLES.get(sym, []))
+        bias_4h = indicators.trend_bias(CANDLES_4H.get(sym, []))
+        bias_1d = indicators.trend_bias(CANDLES_1D.get(sym, []))
+        higher_tf_bias = 0.5 * bias_1h + 0.3 * bias_4h + 0.2 * bias_1d
+        alignment_adj = higher_tf_bias * 15.0
+        ta_score = max(-100.0, min(100.0, ta["score"] + alignment_adj))
+
         sent = news.coin_sentiment(headlines, sym)
-        total = strategy.combine(ta["score"], sent["score"])
+        total = strategy.combine(ta_score, sent["score"])
         reasons = list(ta["reasons"])
+        if abs(alignment_adj) >= 5:
+            direction = "supportive" if alignment_adj > 0 else "opposing"
+            reasons.append(f"1h/4h/1d trend {direction} ({alignment_adj:+.0f})")
         if sent["top_headline"]:
             reasons.append(f"Headline: “{sent['top_headline'][:90]}”")
         prices[sym] = ta["price"]
         signals.append({
             "symbol": sym, "name": meta["name"], "price": ta["price"],
-            "change24h": ta["change24h"], "rsi": ta["rsi"], "ta": ta["score"],
+            "change24h": ta["change24h"], "rsi": ta["rsi"], "ta": ta_score,
             "news": sent["score"], "news_count": sent["count"], "total": total,
             "label": strategy.classify(total), "reasons": reasons, "action": "",
         })
@@ -153,6 +199,11 @@ def _cycle():
 
     actions = []
     if not PAUSED:
+        for s in signals:  # adapt each open position's stop/target to latest price + volatility
+            sym = s["symbol"]
+            if sym in TRADER.positions:
+                TRADER.update_trailing(sym, s["price"], atrs.get(sym, 0.0), trend_ok=s["total"] >= 0)
+
         actions.extend(TRADER.check_exits(prices))
 
         for s in signals:  # signal-driven exits
@@ -168,7 +219,7 @@ def _cycle():
                 continue
             reason = (f"Score {s['total']:+.0f} (TA {s['ta']:+.0f} / news {s['news']:+.0f}): "
                       + "; ".join(s["reasons"][:3]))
-            if TRADER.buy(sym, s["price"], reason[:220], prices):
+            if TRADER.buy(sym, s["price"], reason[:220], prices, atrs.get(sym, 0.0)):
                 actions.append(f"Opened {sym} at ${s['price']:,.2f} (signal {s['total']:+.0f}).")
 
     for s in signals:
@@ -182,9 +233,11 @@ def _cycle():
                 s["action"] = "Buy signal — blocked (max positions)"
             elif TRADER.cash < MIN_TRADE_CASH:
                 s["action"] = "Buy signal — blocked (low cash)"
+            elif TRADER.in_cooldown(sym):
+                s["action"] = "Buy signal — cooling down after recent exit"
             else:
                 s["action"] = "Buy signal"
-        elif s["total"] >= 12:
+        elif s["total"] >= 10:
             s["action"] = "Watching for entry"
         else:
             s["action"] = "Monitoring"
@@ -204,7 +257,7 @@ def _cycle():
             "value": value, "pnl": pnl,
             "pnl_pct": (price / p["entry"] - 1.0) * 100.0,
             "opened": p["opened"],
-            "stop": p["entry"] * (1 + STOP_LOSS), "target": p["entry"] * (1 + TAKE_PROFIT),
+            "stop": p["stop"], "target": p["target"],
         })
 
     snapshot = {
