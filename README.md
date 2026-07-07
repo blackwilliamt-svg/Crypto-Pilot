@@ -11,12 +11,20 @@ pip install fastapi uvicorn requests
 python main.py
 ```
 
-Then open **http://127.0.0.1:8899**. The first cycle takes ~15 seconds (it fetches
-candles for 10 coins plus 5 news feeds), after which the bot re-evaluates every 75 seconds.
+Then open **http://127.0.0.1:8899**. The first cycle takes a bit longer than usual
+since it discovers the tradable coin universe and pulls full candle history for
+each coin; after that the bot re-evaluates every 75 seconds with cheap incremental
+candle fetches.
 
 ## How it decides
 
-Each cycle, for 10 major coins (BTC, ETH, SOL, XRP, ADA, DOGE, DOT, LINK, AVAX, LTC):
+**Coin universe** (refreshed every 6 hours): every coin with market cap over
+**$100M**, excluding stablecoins, that's also spot-tradable against USD on Kraken
+(our only price/candle source — CoinGecko provides market cap + stablecoin data,
+Kraken provides prices, so the tradable set is their intersection, capped at 150
+coins by market cap). Typically ~100-150 coins.
+
+Each cycle, for every coin in the universe:
 
 1. **Technical score (65% weight)** from hourly Kraken candles:
    RSI(14) overbought/oversold, MACD(12,26,9) crossovers and momentum,
@@ -37,7 +45,7 @@ actions taken each cycle.
 | File | Purpose |
 |---|---|
 | `main.py` | FastAPI app, bot loop, REST API |
-| `market.py` | Kraken public OHLC client |
+| `market.py` | Kraken public OHLC client + CoinGecko universe discovery |
 | `indicators.py` | RSI / MACD / EMA / Bollinger + composite TA score |
 | `news.py` | RSS scanning + lexicon sentiment |
 | `strategy.py` | Score weighting and signal thresholds |

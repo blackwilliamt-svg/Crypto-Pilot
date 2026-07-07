@@ -22,6 +22,8 @@ from trader import PaperTrader, STOP_LOSS, TAKE_PROFIT, MAX_POSITIONS, MIN_TRADE
 ROOT = Path(__file__).parent
 CYCLE_SECONDS = 75
 NEWS_REFRESH_SECONDS = 300
+UNIVERSE_REFRESH_SECONDS = 6 * 3600
+CANDLE_HISTORY_LIMIT = 750  # ~31 days hourly — enough headroom for every indicator + 7d chart
 
 @asynccontextmanager
 async def _lifespan(app):
@@ -34,27 +36,51 @@ app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 LOCK = threading.Lock()
 STATE: dict = {"status": "starting", "error": None}
+UNIVERSE: dict[str, dict] = {}
 CANDLES: dict[str, list[dict]] = {}
 HEADLINES: list[dict] = []
+NEWS_PATTERNS: dict[str, tuple] = {}
 _last_news = 0.0
+_last_universe = 0.0
 PAUSED = False
 TRADER = PaperTrader(str(ROOT / "cryptopilot.db"))
 
 
+def _refresh_universe():
+    global UNIVERSE, NEWS_PATTERNS, _last_universe
+    fresh = market.discover_universe()
+    if fresh:
+        UNIVERSE = fresh
+        NEWS_PATTERNS = news.build_coin_patterns(UNIVERSE)
+        for sym in list(CANDLES):
+            if sym not in UNIVERSE:
+                del CANDLES[sym]
+    _last_universe = time.time()
+
+
 def _refresh_candles():
-    for sym, meta in market.COINS.items():
+    for sym, meta in UNIVERSE.items():
+        existing = CANDLES.get(sym, [])
+        since = existing[-1]["t"] if existing else None
         try:
-            CANDLES[sym] = market.fetch_ohlc(meta["pair"])
+            new_rows = market.fetch_ohlc(meta["pair"], since=since)
         except Exception:
-            pass  # keep previous candles for this coin
-        time.sleep(0.3)  # stay well under Kraken's public rate limit
+            new_rows = []
+        if new_rows:
+            if existing:
+                existing_ts = {c["t"] for c in existing}
+                merged = existing + [r for r in new_rows if r["t"] not in existing_ts]
+            else:
+                merged = new_rows
+            CANDLES[sym] = merged[-CANDLE_HISTORY_LIMIT:]
+        time.sleep(0.25)  # stay well under Kraken's public rate limit
     if not CANDLES:
         raise RuntimeError("Could not fetch market data from Kraken")
 
 
 def _refresh_news():
     global HEADLINES, _last_news
-    fetched = news.fetch_headlines()
+    fetched = news.fetch_headlines(NEWS_PATTERNS)
     if fetched:
         HEADLINES = fetched
     _last_news = time.time()
@@ -96,13 +122,15 @@ def _build_summary(signals, actions, prices, headlines):
 
 def _cycle():
     global STATE
+    if not UNIVERSE or time.time() - _last_universe > UNIVERSE_REFRESH_SECONDS:
+        _refresh_universe()
     _refresh_candles()
     if time.time() - _last_news > NEWS_REFRESH_SECONDS:
         _refresh_news()
 
     headlines = HEADLINES
     prices, signals = {}, []
-    for sym, meta in market.COINS.items():
+    for sym, meta in UNIVERSE.items():
         candles = CANDLES.get(sym)
         if not candles or len(candles) < 60:
             continue
@@ -241,7 +269,7 @@ def api_coin(symbol: str):
     upper, lower = indicators.rolling_bollinger(closes)
     return {
         "symbol": symbol,
-        "name": market.COINS[symbol]["name"],
+        "name": UNIVERSE.get(symbol, {}).get("name", symbol),
         "candles": window,
         "ema20": e20,
         "ema50": e50,

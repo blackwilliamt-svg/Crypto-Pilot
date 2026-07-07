@@ -36,19 +36,32 @@ BEARISH = {
     "sinks": 2, "plummets": 3, "breaks below": 2, "losses": 1, "seized": 2,
 }
 
-COIN_PATTERNS = {
-    "BTC":  r"bitcoin|\bbtc\b",
-    "ETH":  r"ethereum|\bether\b|\beth\b",
-    "SOL":  r"solana|\bsol\b",
-    "XRP":  r"\bxrp\b|ripple",
-    "ADA":  r"cardano|\bada\b",
-    "DOGE": r"dogecoin|\bdoge\b",
-    "DOT":  r"polkadot",
-    "LINK": r"chainlink",
-    "AVAX": r"avalanche|\bavax\b",
-    "LTC":  r"litecoin|\bltc\b",
-}
-_coin_res = {sym: re.compile(pat, re.I) for sym, pat in COIN_PATTERNS.items()}
+def build_coin_patterns(universe: dict[str, dict]) -> dict[str, tuple]:
+    """Per-symbol (name_regex, ticker_regex) built from the live coin universe.
+    Both match on word boundaries. Name match is case-insensitive; ticker match
+    is case-sensitive to avoid tickers that double as common English words
+    (e.g. ONE, NEAR) matching ordinary headline text. Names/tickers under 3
+    characters (e.g. "RE", "H", "A") are skipped entirely — too short to
+    reliably distinguish from ordinary words even with boundaries — so those
+    coins fall back to market-wide sentiment only, with no specific matching."""
+    patterns = {}
+    for sym, meta in universe.items():
+        name = meta["name"]
+        name_re = re.compile(r"\b" + re.escape(name) + r"\b", re.I) if len(name) >= 3 else None
+        ticker_re = re.compile(r"\b" + re.escape(sym) + r"\b") if len(sym) >= 3 else None
+        if name_re or ticker_re:
+            patterns[sym] = (name_re, ticker_re)
+    return patterns
+
+
+def _coin_matches(patterns: dict[str, tuple], text: str) -> list[str]:
+    coins = []
+    for sym, (name_re, ticker_re) in patterns.items():
+        if (name_re and name_re.search(text)) or (ticker_re and ticker_re.search(text)):
+            coins.append(sym)
+    return coins
+
+
 _term_res = {
     term: (re.compile(r"\b" + re.escape(term) + r"\b", re.I), w)
     for lex in (BULLISH, BEARISH) for term, w in lex.items()
@@ -85,7 +98,7 @@ def _parse_feed(source: str, xml_text: str) -> list[dict]:
     return items
 
 
-def fetch_headlines(max_age_hours: float = 48.0) -> list[dict]:
+def fetch_headlines(patterns: dict[str, tuple], max_age_hours: float = 48.0) -> list[dict]:
     """Fetch + score all feeds. Individual feed failures are skipped."""
     now = time.time()
     seen: set[str] = set()
@@ -103,7 +116,7 @@ def fetch_headlines(max_age_hours: float = 48.0) -> list[dict]:
                 continue
             seen.add(key)
             sent = _score_text(it["title"])
-            coins = [sym for sym, rx in _coin_res.items() if rx.search(it["title"])]
+            coins = _coin_matches(patterns, it["title"])
             it.update({
                 "sentiment": sent,
                 "coins": coins,
