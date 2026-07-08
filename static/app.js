@@ -45,6 +45,19 @@ function renderHeader(st) {
   pill.className = "status-pill " + st.status;
   $("status-text").textContent = st.status.toUpperCase();
   $("btn-pause").textContent = st.paused ? "Resume" : "Pause";
+
+  const live = st.mode === "live";
+  const badge = $("mode-badge");
+  badge.textContent = live ? "LIVE TRADING" : "PAPER TRADING";
+  badge.className = "paper-badge" + (live ? " live" : "");
+  $("btn-mode").textContent = live ? "Back to Paper" : "Go Live";
+  $("footer-note").textContent = live
+    ? "LIVE TRADING — real orders are being sent to Kraken with real funds. Signals are experimental and not financial advice."
+    : "Paper trading — no real funds are used. Market data: Kraken public API · Headlines: public RSS feeds. Signals are experimental and not financial advice.";
+
+  const sel = $("style-select");
+  if (st.style && document.activeElement !== sel) sel.value = st.style;
+
   if (st.portfolio) {
     $("h-equity").textContent = fmtMoney(st.portfolio.equity);
     const pnl = st.portfolio.total_pnl;
@@ -85,9 +98,22 @@ function renderPortfolio(st) {
       <td>${fmtMoney(pos.value)}</td>
       <td class="${pnlClass(pos.pnl)}">${fmtMoney(pos.pnl, true)} (${fmtPct(pos.pnl_pct)})</td>
       <td class="muted">${fmtPrice(pos.stop)} / ${fmtPrice(pos.target)}</td>
+      <td><button class="btn btn-close" data-close="${esc(pos.symbol)}">Close</button></td>
     </tr>`).join("");
+  tbody.querySelectorAll("[data-close]").forEach((btn) =>
+    btn.addEventListener("click", () => closePosition(btn.dataset.close)));
   $("positions-empty").classList.toggle("hidden", (st.positions || []).length > 0);
   drawSpark(p.equity_history || [], p.start_cash);
+}
+
+async function closePosition(sym) {
+  if (!confirm(`Close the ${sym} position at the current market price?`)) return;
+  const r = await fetch(`/api/position/${sym}/close`, { method: "POST" });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    alert(`Could not close ${sym}: ${err.detail || r.statusText}`);
+  }
+  poll();
 }
 
 function renderSignals(st) {
@@ -275,6 +301,45 @@ async function poll() {
 
 $("btn-pause").addEventListener("click", async () => {
   await fetch("/api/bot/toggle", { method: "POST" });
+  poll();
+});
+$("style-select").addEventListener("change", async (e) => {
+  const r = await fetch("/api/style", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ style: e.target.value }),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    alert("Could not switch style: " + (err.detail || r.statusText));
+  }
+  poll();
+});
+$("btn-mode").addEventListener("click", async () => {
+  const goingLive = (lastState?.mode || "paper") === "paper";
+  let body;
+  if (goingLive) {
+    const typed = prompt(
+      "You are about to switch to LIVE TRADING.\n\n" +
+      "Real market orders will be sent to Kraken using real funds from your account. " +
+      "All open paper positions must be closed first, and KRAKEN_API_KEY / KRAKEN_API_SECRET " +
+      "must be set in the bot's environment.\n\n" +
+      "Type GO LIVE to confirm:");
+    if (typed === null) return;
+    body = { mode: "live", confirm: typed };
+  } else {
+    if (!confirm("Switch back to paper trading? (Close any open live positions first.)")) return;
+    body = { mode: "paper" };
+  }
+  const r = await fetch("/api/mode", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    alert("Mode switch failed: " + (err.detail || r.statusText));
+  }
   poll();
 });
 $("btn-reset").addEventListener("click", async () => {

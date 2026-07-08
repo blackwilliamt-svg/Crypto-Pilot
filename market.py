@@ -12,8 +12,9 @@ _session = requests.Session()
 _session.headers["User-Agent"] = "CryptoPilot-paper-bot/1.0"
 
 
-def _kraken_usd_pairs() -> dict[str, str]:
-    """Map base-asset ticker (e.g. 'BTC') -> Kraken pair name (e.g. 'XBTUSD')."""
+def _kraken_usd_pairs() -> dict[str, dict]:
+    """Map base-asset ticker (e.g. 'BTC') -> pair info: Kraken pair name plus
+    the order-precision metadata (lot_decimals, ordermin) live orders need."""
     r = _session.get(f"{KRAKEN_BASE}/AssetPairs", timeout=15)
     r.raise_for_status()
     data = r.json()
@@ -28,7 +29,11 @@ def _kraken_usd_pairs() -> dict[str, str]:
             continue
         base = wsname.split("/")[0]
         symbol = "BTC" if base == "XBT" else base  # Kraken's legacy BTC ticker
-        pairs.setdefault(symbol, pair_name)
+        pairs.setdefault(symbol, {
+            "pair": pair_name,
+            "lot_decimals": int(info.get("lot_decimals", 8)),
+            "ordermin": float(info.get("ordermin", 0) or 0),
+        })
     return pairs
 
 
@@ -67,10 +72,10 @@ def discover_universe(max_coins: int = MAX_COINS) -> dict[str, dict]:
             if row["id"] in stable_ids:
                 continue
             symbol = row["symbol"].upper()
-            pair = kraken_pairs.get(symbol)
-            if not pair or symbol in coins:
+            pair_info = kraken_pairs.get(symbol)
+            if not pair_info or symbol in coins:
                 continue
-            coins[symbol] = {"name": row["name"], "pair": pair, "market_cap": mcap}
+            coins[symbol] = {"name": row["name"], "market_cap": mcap, **pair_info}
             if len(coins) >= max_coins:
                 break
         if below_threshold:

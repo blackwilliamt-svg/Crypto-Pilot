@@ -1,23 +1,29 @@
-"""CryptoPilot — paper-trading crypto bot with TA + headline sentiment.
+"""CryptoPilot — crypto trading bot with TA + headline sentiment.
+
+Runs in paper mode by default. Live mode (real Kraken orders) must be armed
+explicitly from the dashboard and requires KRAKEN_API_KEY / KRAKEN_API_SECRET
+environment variables — see exchange.py for the safety notes.
 
 Run:  python main.py   (serves the dashboard at http://127.0.0.1:8899)
 """
 import copy
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import exchange
 import indicators
 import market
 import news
 import strategy
-from trader import PaperTrader, MAX_POSITIONS, MIN_TRADE_CASH, START_CASH
+from trader import PaperTrader, MIN_TRADE_CASH, START_CASH
 
 ROOT = Path(__file__).parent
 CYCLE_SECONDS = 45  # aggressive: re-evaluate faster now that the signal runs on 15m candles
@@ -57,7 +63,21 @@ _last_1h = 0.0
 _last_4h = 0.0
 _last_1d = 0.0
 PAUSED = False
+MODE = "paper"  # "paper" | "live" — never defaults to live
+TRADE_LOCK = threading.Lock()  # guards trader mutations (cycle thread vs API endpoints)
 TRADER = PaperTrader(str(ROOT / "cryptopilot.db"))
+
+# Restore persisted style; restore live mode only if credentials still present.
+strategy.set_style(TRADER.kv_get("style", "aggressive"))
+if TRADER.kv_get("mode") == "live":
+    if exchange.credentials_present():
+        try:
+            TRADER.executor = exchange.LiveExecutor()
+            MODE = "live"
+        except Exception:
+            pass
+    if MODE != "live":
+        TRADER.kv_set("mode", "paper")  # keys gone — fail safe back to paper
 
 
 def _refresh_universe():
@@ -199,28 +219,30 @@ def _cycle():
 
     actions = []
     if not PAUSED:
-        for s in signals:  # adapt each open position's stop/target to latest price + volatility
-            sym = s["symbol"]
-            if sym in TRADER.positions:
-                TRADER.update_trailing(sym, s["price"], atrs.get(sym, 0.0), trend_ok=s["total"] >= 0)
+        with TRADE_LOCK:
+            for s in signals:  # adapt each open position's stop/target to latest price + volatility
+                sym = s["symbol"]
+                if sym in TRADER.positions:
+                    TRADER.update_trailing(sym, s["price"], atrs.get(sym, 0.0), trend_ok=s["total"] >= 0)
 
-        actions.extend(TRADER.check_exits(prices))
+            actions.extend(TRADER.check_exits(prices, UNIVERSE))
 
-        for s in signals:  # signal-driven exits
-            sym = s["symbol"]
-            if sym in TRADER.positions and s["total"] <= strategy.SELL_THRESHOLD:
-                reason = f"Signal turned bearish ({s['total']:+.0f}): " + "; ".join(s["reasons"][:2])
-                pnl = TRADER.sell(sym, s["price"], reason[:200])
-                actions.append(f"Sold {sym} at ${s['price']:,.2f} on bearish signal (P&L {pnl:+,.2f} USD).")
+            for s in signals:  # signal-driven exits
+                sym = s["symbol"]
+                if sym in TRADER.positions and s["total"] <= strategy.PARAMS["sell_threshold"]:
+                    reason = f"Signal turned bearish ({s['total']:+.0f}): " + "; ".join(s["reasons"][:2])
+                    pnl = TRADER.sell(sym, s["price"], reason[:200], UNIVERSE.get(sym))
+                    if pnl is not None:
+                        actions.append(f"Sold {sym} at ${s['price']:,.2f} on bearish signal (P&L {pnl:+,.2f} USD).")
 
-        for s in signals:  # entries, best score first
-            sym = s["symbol"]
-            if s["total"] < strategy.BUY_THRESHOLD or sym in TRADER.positions:
-                continue
-            reason = (f"Score {s['total']:+.0f} (TA {s['ta']:+.0f} / news {s['news']:+.0f}): "
-                      + "; ".join(s["reasons"][:3]))
-            if TRADER.buy(sym, s["price"], reason[:220], prices, atrs.get(sym, 0.0)):
-                actions.append(f"Opened {sym} at ${s['price']:,.2f} (signal {s['total']:+.0f}).")
+            for s in signals:  # entries, best score first
+                sym = s["symbol"]
+                if s["total"] < strategy.PARAMS["buy_threshold"] or sym in TRADER.positions:
+                    continue
+                reason = (f"Score {s['total']:+.0f} (TA {s['ta']:+.0f} / news {s['news']:+.0f}): "
+                          + "; ".join(s["reasons"][:3]))
+                if TRADER.buy(sym, s["price"], reason[:220], prices, atrs.get(sym, 0.0), UNIVERSE.get(sym)):
+                    actions.append(f"Opened {sym} at ${s['price']:,.2f} (signal {s['total']:+.0f}).")
 
     for s in signals:
         sym = s["symbol"]
@@ -228,8 +250,8 @@ def _cycle():
         if pos:
             ret = (s["price"] / pos["entry"] - 1.0) * 100.0
             s["action"] = f"Holding since ${pos['entry']:,.2f} ({ret:+.1f}%)"
-        elif s["total"] >= strategy.BUY_THRESHOLD:
-            if len(TRADER.positions) >= MAX_POSITIONS:
+        elif s["total"] >= strategy.PARAMS["buy_threshold"]:
+            if len(TRADER.positions) >= strategy.PARAMS["max_positions"]:
                 s["action"] = "Buy signal — blocked (max positions)"
             elif TRADER.cash < MIN_TRADE_CASH:
                 s["action"] = "Buy signal — blocked (low cash)"
@@ -265,6 +287,10 @@ def _cycle():
         "error": None,
         "updated_at": time.time(),
         "paused": PAUSED,
+        "mode": MODE,
+        "style": strategy.ACTIVE_STYLE,
+        "live_ready": exchange.credentials_present(),
+        "last_order_error": TRADER.last_order_error(),
         "portfolio": {
             "equity": equity, "cash": TRADER.cash, "start_cash": START_CASH,
             "positions_value": equity - TRADER.cash,
@@ -345,8 +371,73 @@ def api_toggle():
 
 @app.post("/api/reset")
 def api_reset():
-    TRADER.reset()
+    with TRADE_LOCK:
+        TRADER.reset()
     return {"ok": True}
+
+
+@app.post("/api/position/{symbol}/close")
+def api_close_position(symbol: str):
+    symbol = symbol.upper()
+    with TRADE_LOCK:
+        if symbol not in TRADER.positions:
+            raise HTTPException(404, "no open position for that symbol")
+        candles = CANDLES_15M.get(symbol)
+        price = candles[-1]["c"] if candles else TRADER.positions[symbol]["entry"]
+        pnl = TRADER.sell(symbol, price, "Manual close from dashboard", UNIVERSE.get(symbol))
+    if pnl is None:
+        err = TRADER.last_order_error() or {}
+        raise HTTPException(502, f"exchange order failed: {err.get('error', 'unknown error')}")
+    return {"ok": True, "symbol": symbol, "price": price, "pnl": pnl}
+
+
+@app.post("/api/style")
+def api_style(payload: dict = Body(...)):
+    style = str(payload.get("style", "")).lower()
+    if not strategy.set_style(style):
+        raise HTTPException(400, f"unknown style; pick one of {list(strategy.STYLES)}")
+    TRADER.kv_set("style", style)
+    return {"ok": True, "style": style, "params": strategy.PARAMS}
+
+
+@app.post("/api/mode")
+def api_mode(payload: dict = Body(...)):
+    """Switch paper <-> live. Live requires: API keys in the environment, no
+    open positions (close them first so no position straddles the boundary),
+    and the literal confirmation phrase typed by the user."""
+    global MODE
+    target = str(payload.get("mode", "")).lower()
+    if target not in ("paper", "live"):
+        raise HTTPException(400, "mode must be 'paper' or 'live'")
+    if target == MODE:
+        return {"ok": True, "mode": MODE}
+
+    with TRADE_LOCK:
+        if TRADER.positions:
+            raise HTTPException(409, "close all open positions before switching modes")
+        if target == "live":
+            if payload.get("confirm") != "GO LIVE":
+                raise HTTPException(400, "confirmation phrase mismatch — type GO LIVE to confirm")
+            if not exchange.credentials_present():
+                raise HTTPException(400, "KRAKEN_API_KEY / KRAKEN_API_SECRET not set in the environment")
+            try:
+                executor = exchange.LiveExecutor()
+                balance = executor.api.usd_balance()
+            except Exception as e:
+                raise HTTPException(502, f"could not reach Kraken private API: {e}")
+            bankroll = min(balance, float(os.environ.get("LIVE_BANKROLL_USD", balance or 0)))
+            if bankroll < MIN_TRADE_CASH:
+                raise HTTPException(400,
+                    f"available USD balance ${balance:,.2f} is below the ${MIN_TRADE_CASH:,.0f} minimum trade size")
+            TRADER.executor = executor
+            TRADER.cash = bankroll
+            TRADER._save()
+            MODE = "live"
+        else:
+            TRADER.executor = None
+            MODE = "paper"
+        TRADER.kv_set("mode", MODE)
+    return {"ok": True, "mode": MODE, "cash": TRADER.cash}
 
 
 if __name__ == "__main__":

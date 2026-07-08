@@ -11,13 +11,21 @@
   <div class="brand">
     <span class="logo">◆</span>
     <h1>CryptoPilot</h1>
-    <span class="paper-badge">PAPER TRADING</span>
+    <span id="mode-badge" class="paper-badge">PAPER TRADING</span>
   </div>
   <div class="header-stats">
+    <div class="hstat"><span class="hstat-label">Style</span>
+      <select id="style-select" class="btn style-select">
+        <option value="conservative">Conservative</option>
+        <option value="balanced">Balanced</option>
+        <option value="aggressive">Aggressive</option>
+      </select>
+    </div>
     <div class="hstat"><span class="hstat-label">Equity</span><span id="h-equity" class="hstat-value">—</span></div>
     <div class="hstat"><span class="hstat-label">Total P&amp;L</span><span id="h-pnl" class="hstat-value">—</span></div>
     <div id="status-pill" class="status-pill starting"><span class="dot"></span><span id="status-text">STARTING</span></div>
     <button id="btn-pause" class="btn">Pause</button>
+    <button id="btn-mode" class="btn">Go Live</button>
     <button id="btn-reset" class="btn btn-danger">Reset</button>
   </div>
 </header>
@@ -37,7 +45,7 @@
       <div class="card-head"><h2>💼 Portfolio</h2><canvas id="spark" width="260" height="56"></canvas></div>
       <div class="port-stats" id="port-stats"></div>
       <table class="table" id="positions-table">
-        <thead><tr><th>Coin</th><th>Qty</th><th>Entry</th><th>Now</th><th>Value</th><th>P&amp;L</th><th>Stop / Target</th></tr></thead>
+        <thead><tr><th>Coin</th><th>Qty</th><th>Entry</th><th>Now</th><th>Value</th><th>P&amp;L</th><th>Stop / Target</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
       <div id="positions-empty" class="empty hidden">No open positions — the bot is waiting for a strong enough signal.</div>
@@ -73,8 +81,8 @@
     </section>
   </div>
 
-  <footer>
-    Paper trading only — no real funds are used. Market data: Kraken public API · Headlines: public RSS feeds.
+  <footer id="footer-note">
+    Paper trading — no real funds are used. Market data: Kraken public API · Headlines: public RSS feeds.
     Signals are experimental and not financial advice.
   </footer>
 </main>
