@@ -1,15 +1,21 @@
-"""Trading styles + signal combination/classification.
+"""Trading styles + signal combination/classification + regime adjustment.
 
-Three profiles trade off reaction speed and risk appetite. The active style
-is switched at runtime from the dashboard and persisted in the database, so
-thresholds/limits are read through PARAMS instead of module constants.
+Three style profiles trade off reaction speed and risk appetite; the market
+regime (regime.py) then overlays defensive adjustments on top. PARAMS is
+always the fully-resolved dict (style x regime) that the rest of the app
+reads — call set_style()/set_regime() to change either input.
+
+risk_per_trade is the fraction of equity a position may LOSE if its initial
+stop is hit (equal-risk sizing) — not the position's notional size.
 """
 
 STYLES: dict[str, dict] = {
     "conservative": {
         "ta_weight": 0.60, "news_weight": 0.40,
         "buy_threshold": 38.0, "sell_threshold": -28.0,
-        "max_positions": 4, "position_fraction": 0.15,
+        "max_positions": 4, "position_fraction": 0.20,
+        "risk_per_trade": 0.010,
+        "daily_max_loss": 0.02,
         "atr_stop_mult": 2.5, "atr_target_mult": 3.5,
         "max_stop_pct": -0.06,
         "reentry_cooldown": 7200,
@@ -17,7 +23,9 @@ STYLES: dict[str, dict] = {
     "balanced": {
         "ta_weight": 0.65, "news_weight": 0.35,
         "buy_threshold": 30.0, "sell_threshold": -25.0,
-        "max_positions": 5, "position_fraction": 0.18,
+        "max_positions": 5, "position_fraction": 0.22,
+        "risk_per_trade": 0.015,
+        "daily_max_loss": 0.03,
         "atr_stop_mult": 2.0, "atr_target_mult": 3.0,
         "max_stop_pct": -0.10,
         "reentry_cooldown": 3600,
@@ -25,7 +33,9 @@ STYLES: dict[str, dict] = {
     "aggressive": {
         "ta_weight": 0.70, "news_weight": 0.30,
         "buy_threshold": 24.0, "sell_threshold": -18.0,
-        "max_positions": 8, "position_fraction": 0.12,
+        "max_positions": 8, "position_fraction": 0.25,
+        "risk_per_trade": 0.020,
+        "daily_max_loss": 0.04,
         "atr_stop_mult": 1.8, "atr_target_mult": 2.8,
         "max_stop_pct": -0.10,
         "reentry_cooldown": 1800,
@@ -33,16 +43,42 @@ STYLES: dict[str, dict] = {
 }
 
 ACTIVE_STYLE = "aggressive"
-PARAMS = STYLES[ACTIVE_STYLE]
+ACTIVE_REGIME = "neutral"
+PARAMS: dict = {}
+
+
+def _rebuild():
+    global PARAMS
+    p = dict(STYLES[ACTIVE_STYLE])
+    if ACTIVE_REGIME == "neutral":
+        p["buy_threshold"] += 3.0
+    elif ACTIVE_REGIME == "risk_off":
+        # Defensive: much stricter entries, half the risk budget, fewer
+        # concurrent bets. Exits/stops are untouched — de-risking never
+        # blocks getting OUT of a position.
+        p["buy_threshold"] += 10.0
+        p["risk_per_trade"] *= 0.5
+        p["max_positions"] = max(2, p["max_positions"] - 2)
+    PARAMS = p
 
 
 def set_style(name: str) -> bool:
-    global ACTIVE_STYLE, PARAMS
+    global ACTIVE_STYLE
     if name not in STYLES:
         return False
     ACTIVE_STYLE = name
-    PARAMS = STYLES[name]
+    _rebuild()
     return True
+
+
+def set_regime(name: str):
+    global ACTIVE_REGIME
+    if name in ("risk_on", "neutral", "risk_off"):
+        ACTIVE_REGIME = name
+        _rebuild()
+
+
+_rebuild()
 
 
 def combine(ta_score: float, news_score: float) -> float:

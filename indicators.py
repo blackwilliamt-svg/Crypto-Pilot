@@ -62,6 +62,66 @@ def roc(closes: list[float], n: int = 10) -> float:
     return (closes[-1] / closes[-1 - n] - 1.0) * 100.0
 
 
+def adx(candles: list[dict], period: int = 14) -> float:
+    """Average Directional Index (Wilder) — trend STRENGTH regardless of
+    direction. <18 means chop (trend signals unreliable); >25 means a real
+    trend is in force."""
+    if len(candles) < period * 2 + 1:
+        return 0.0
+    plus_dm, minus_dm, trs = [], [], []
+    for i in range(1, len(candles)):
+        h, l = candles[i]["h"], candles[i]["l"]
+        ph, pl, pc = candles[i - 1]["h"], candles[i - 1]["l"], candles[i - 1]["c"]
+        up, dn = h - ph, pl - l
+        plus_dm.append(up if up > dn and up > 0 else 0.0)
+        minus_dm.append(dn if dn > up and dn > 0 else 0.0)
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+    def wilder_smooth(vals):
+        s = sum(vals[:period])
+        out = [s]
+        for v in vals[period:]:
+            s = s - s / period + v
+            out.append(s)
+        return out
+
+    str_, spd, smd = wilder_smooth(trs), wilder_smooth(plus_dm), wilder_smooth(minus_dm)
+    dxs = []
+    for t, p, m in zip(str_, spd, smd):
+        if t == 0:
+            continue
+        pdi, mdi = 100.0 * p / t, 100.0 * m / t
+        denom = pdi + mdi
+        if denom:
+            dxs.append(100.0 * abs(pdi - mdi) / denom)
+    if len(dxs) < period:
+        return 0.0
+    a = sum(dxs[:period]) / period
+    for d in dxs[period:]:
+        a = (a * (period - 1) + d) / period
+    return a
+
+
+def stoch_rsi(closes: list[float], period: int = 14) -> float:
+    """Stochastic RSI (0..1): where the current RSI sits inside its own
+    recent range. More sensitive than raw RSI at catching turns."""
+    if len(closes) < period * 2 + 1:
+        return 0.5
+    rsis = [rsi(closes[: i + 1][-period * 3:], period) for i in range(len(closes) - period, len(closes))]
+    lo, hi = min(rsis), max(rsis)
+    return 0.5 if hi == lo else (rsis[-1] - lo) / (hi - lo)
+
+
+def volume_zscore(candles: list[dict], lookback: int = 20) -> float:
+    """How unusual the latest bar's volume is vs the prior `lookback` bars."""
+    if len(candles) < lookback + 1:
+        return 0.0
+    vols = [c["v"] for c in candles[-(lookback + 1):-1]]
+    mean = sum(vols) / len(vols)
+    sd = (sum((v - mean) ** 2 for v in vols) / len(vols)) ** 0.5
+    return 0.0 if sd == 0 else (candles[-1]["v"] - mean) / sd
+
+
 def atr(candles: list[dict], period: int = 14) -> float:
     """Average True Range (Wilder-smoothed) — used to size stops/targets to
     each coin's own volatility instead of a one-size-fits-all percentage."""
@@ -107,8 +167,21 @@ def analyze(candles: list[dict], bars_per_hour: int = 1) -> dict:
     e20, e50 = ema_series(closes, 20), ema_series(closes, 50)
     _, _, _, pct_b = bollinger(closes)
     momentum = roc(closes, 10)
+    trend_strength = adx(candles)
+    srsi = stoch_rsi(closes)
+    vol_z = volume_zscore(candles)
     n24 = 24 * bars_per_hour
     change24 = (price / closes[-(n24 + 1)] - 1.0) * 100.0 if len(closes) > n24 else 0.0
+
+    # Trend-following components get scaled by ADX: full weight in a real
+    # trend, halved in chop where EMA/MACD signals mostly whipsaw.
+    if trend_strength >= 25:
+        trend_w = 1.0
+    elif trend_strength >= 18:
+        trend_w = 0.75
+    else:
+        trend_w = 0.5
+        reasons.append(f"Choppy market (ADX {trend_strength:.0f}) — trend signals discounted")
 
     if r <= 30:
         score += 25; reasons.append(f"RSI {r:.0f} oversold — bounce setup")
@@ -122,28 +195,50 @@ def analyze(candles: list[dict], bars_per_hour: int = 1) -> dict:
     cross_up = any(hist[i] <= 0 < hist[i + 1] for i in range(-4, -1))
     cross_dn = any(hist[i] >= 0 > hist[i + 1] for i in range(-4, -1))
     if cross_up:
-        score += 20; reasons.append("MACD bullish crossover (recent bars)")
+        score += 20 * trend_w; reasons.append("MACD bullish crossover (recent bars)")
     elif cross_dn:
-        score -= 20; reasons.append("MACD bearish crossover (recent bars)")
+        score -= 20 * trend_w; reasons.append("MACD bearish crossover (recent bars)")
     elif hist[-1] > 0 and hist[-1] > hist[-2]:
-        score += 12; reasons.append("MACD momentum positive and building")
+        score += 12 * trend_w; reasons.append("MACD momentum positive and building")
     elif hist[-1] > 0:
-        score += 6
+        score += 6 * trend_w
     elif hist[-1] < 0 and hist[-1] < hist[-2]:
-        score -= 12; reasons.append("MACD momentum negative and worsening")
+        score -= 12 * trend_w; reasons.append("MACD momentum negative and worsening")
     else:
-        score -= 6
+        score -= 6 * trend_w
 
     if e20[-1] > e50[-1]:
-        score += 12; reasons.append("Uptrend: EMA20 above EMA50")
+        score += 12 * trend_w
+        if trend_strength >= 25:
+            reasons.append(f"Uptrend with strength (EMA20>EMA50, ADX {trend_strength:.0f})")
+        else:
+            reasons.append("Uptrend: EMA20 above EMA50")
     else:
-        score -= 12; reasons.append("Downtrend: EMA20 below EMA50")
-    score += 5 if price > e20[-1] else -5
+        score -= 12 * trend_w
+        if trend_strength >= 25:
+            reasons.append(f"Downtrend with strength (EMA20<EMA50, ADX {trend_strength:.0f})")
+        else:
+            reasons.append("Downtrend: EMA20 below EMA50")
+    score += (5 if price > e20[-1] else -5) * trend_w
 
     if pct_b < 0.05:
         score += 14; reasons.append("Price at lower Bollinger band")
     elif pct_b > 0.95:
         score -= 14; reasons.append("Price stretched above upper Bollinger band")
+
+    # StochRSI catches turns earlier than raw RSI: only score the extremes.
+    if srsi <= 0.10 and closes[-1] > closes[-2]:
+        score += 8; reasons.append("StochRSI bottomed and turning up")
+    elif srsi >= 0.90 and closes[-1] < closes[-2]:
+        score -= 8; reasons.append("StochRSI topped and turning down")
+
+    # Volume confirmation: an unusual-volume bar in the direction of the move
+    # is conviction; without it, moves are easier to fade.
+    if vol_z >= 2.0:
+        if closes[-1] >= candles[-1]["o"]:
+            score += 6; reasons.append(f"Volume surge confirms buying ({vol_z:.1f}σ)")
+        else:
+            score -= 6; reasons.append(f"Volume surge confirms selling ({vol_z:.1f}σ)")
 
     score += max(-12.0, min(12.0, momentum * 1.5))
     if abs(momentum) >= 2:
@@ -159,6 +254,9 @@ def analyze(candles: list[dict], bars_per_hour: int = 1) -> dict:
         "ema50": e50[-1],
         "pct_b": pct_b,
         "momentum": momentum,
+        "adx": trend_strength,
+        "stoch_rsi": srsi,
+        "vol_z": vol_z,
         "score": max(-100.0, min(100.0, score * 1.1)),
         "reasons": reasons,
     }

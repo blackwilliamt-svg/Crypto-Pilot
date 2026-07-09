@@ -9,9 +9,19 @@ remains the source of truth for stops/targets either way.
 Style-dependent limits (max positions, sizing, thresholds, ATR multipliers,
 cooldown) live in strategy.PARAMS so the dashboard can switch profiles at
 runtime; only style-independent constants are defined here.
+
+Every method that touches self.db/self.positions/self.cash holds self._lock.
+sqlite3's check_same_thread=False only lets multiple threads use the
+connection at all — it does NOT make concurrent use safe. Without this lock,
+the background trading loop and API-triggered calls (manual close, reset,
+mode switch) can interleave statements on the same connection and corrupt
+its transaction state, silently losing a sell/buy that appeared to succeed.
+The lock is reentrant (RLock) because some methods call other locking
+methods internally (e.g. check_exits -> sell -> _save).
 """
 import json
 import sqlite3
+import threading
 import time
 
 import strategy
@@ -24,8 +34,46 @@ MIN_TARGET_PCT = 0.03
 MAX_TARGET_PCT = 0.60
 
 
+def compute_bracket(price: float, atr: float, params: dict) -> tuple[float, float]:
+    """Initial stop/target for an entry at `price` — shared by live trading
+    and the backtester so both always run identical bracket math."""
+    stop = max(price - params["atr_stop_mult"] * atr, price * (1 + params["max_stop_pct"]))
+    stop = min(stop, price * (1 + MIN_STOP_DIST_PCT))
+    target = max(price + params["atr_target_mult"] * atr, price * (1 + MIN_TARGET_PCT))
+    target = min(target, price * (1 + MAX_TARGET_PCT))
+    return stop, target
+
+
+def compute_spend(equity: float, cash: float, price: float, stop: float, params: dict) -> float:
+    """Equal-risk position sizing (see buy() for rationale) — shared with the
+    backtester."""
+    stop_distance = max(price - stop, price * 0.001)
+    risk_budget = equity * params["risk_per_trade"]
+    spend = (risk_budget / stop_distance) * price
+    spend = min(spend, equity * params["position_fraction"], cash)
+    if spend < MIN_TRADE_CASH:
+        spend = min(MIN_TRADE_CASH, cash)
+    return spend
+
+
+def trail_stop_target(pos: dict, price: float, atr: float, trend_ok: bool, params: dict):
+    """Chandelier trailing update applied to a position dict in place —
+    shared by live trading and the backtester. Stop only tightens; target
+    only extends while the trend holds."""
+    pos["high"] = max(pos["high"], price)
+    floor_stop = pos["entry"] * (1 + params["max_stop_pct"])
+    candidate_stop = pos["high"] - params["atr_stop_mult"] * atr
+    ceiling_stop = price * (1 + MIN_STOP_DIST_PCT)
+    pos["stop"] = min(max(pos["stop"], candidate_stop, floor_stop), ceiling_stop)
+    if trend_ok:
+        candidate_target = price + params["atr_target_mult"] * atr
+        max_target = price * (1 + MAX_TARGET_PCT)
+        pos["target"] = min(max(pos["target"], candidate_target), max_target)
+
+
 class PaperTrader:
     def __init__(self, db_path: str):
+        self._lock = threading.RLock()
         self.db = sqlite3.connect(db_path, check_same_thread=False)
         self.db.execute("""CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT,
@@ -43,119 +91,160 @@ class PaperTrader:
     # ---------- persistence ----------
 
     def kv_get(self, key: str, default: str | None = None) -> str | None:
-        row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
-        return row[0] if row else default
+        with self._lock:
+            row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            return row[0] if row else default
 
     def kv_set(self, key: str, value: str):
-        self.db.execute(
-            "INSERT INTO kv (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
-        self.db.commit()
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO kv (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            self.db.commit()
 
     def _load(self):
-        row = self.db.execute("SELECT value FROM kv WHERE key='state'").fetchone()
-        if row:
-            state = json.loads(row[0])
-            self.cash = state["cash"]
-            self.positions = state["positions"]
-            for pos in self.positions.values():  # backfill if loading a pre-trailing-stop save
-                pos.setdefault("high", pos["entry"])
-                pos.setdefault("stop", pos["entry"] * (1 + strategy.PARAMS["max_stop_pct"]))
-                pos.setdefault("target", pos["entry"] * (1 + MIN_TARGET_PCT))
+        with self._lock:
+            row = self.db.execute("SELECT value FROM kv WHERE key='state'").fetchone()
+            if row:
+                state = json.loads(row[0])
+                self.cash = state["cash"]
+                self.positions = state["positions"]
+                for pos in self.positions.values():  # backfill if loading a pre-trailing-stop save
+                    pos.setdefault("high", pos["entry"])
+                    pos.setdefault("stop", pos["entry"] * (1 + strategy.PARAMS["max_stop_pct"]))
+                    pos.setdefault("target", pos["entry"] * (1 + MIN_TARGET_PCT))
 
     def _save(self):
         blob = json.dumps({"cash": self.cash, "positions": self.positions})
         self.kv_set("state", blob)
 
     def reset(self):
-        self.db.execute("DELETE FROM trades")
-        self.db.execute("DELETE FROM equity")
-        self.db.execute("DELETE FROM kv")
-        self.db.commit()
-        self.cash = START_CASH
-        self.positions = {}
-        self.last_exit = {}
-        self._save()
+        with self._lock:
+            self.db.execute("DELETE FROM trades")
+            self.db.execute("DELETE FROM equity")
+            self.db.execute("DELETE FROM kv")
+            self.db.commit()
+            self.cash = START_CASH
+            self.positions = {}
+            self.last_exit = {}
+            self._save()
 
     # ---------- portfolio math ----------
 
     def equity(self, prices: dict[str, float]) -> float:
-        return self.cash + sum(
-            p["qty"] * prices.get(sym, p["entry"]) for sym, p in self.positions.items())
+        with self._lock:
+            return self.cash + sum(
+                p["qty"] * prices.get(sym, p["entry"]) for sym, p in self.positions.items())
 
     def in_cooldown(self, symbol: str) -> bool:
-        return time.time() - self.last_exit.get(symbol, 0.0) < strategy.PARAMS["reentry_cooldown"]
+        with self._lock:
+            return time.time() - self.last_exit.get(symbol, 0.0) < strategy.PARAMS["reentry_cooldown"]
 
     # ---------- trading ----------
 
     def buy(self, symbol: str, price: float, reason: str, prices: dict[str, float],
             atr: float = 0.0, meta: dict | None = None) -> bool:
-        params = strategy.PARAMS
-        if symbol in self.positions or len(self.positions) >= params["max_positions"]:
-            return False
-        if self.in_cooldown(symbol):
-            return False
-        if self.cash < MIN_TRADE_CASH:
-            return False
-        spend = min(self.cash, max(MIN_TRADE_CASH, self.equity(prices) * params["position_fraction"]))
-        fee = spend * FEE_RATE
-        qty = (spend - fee) / price
-
-        if self.executor is not None:  # live: place the real order first
-            try:
-                qty = self.executor.execute("buy", meta or {}, qty, price)
-            except Exception as e:
-                self._log_order_failure(symbol, "BUY", str(e))
+        with self._lock:
+            params = strategy.PARAMS
+            if symbol in self.positions or len(self.positions) >= params["max_positions"]:
                 return False
-            fee = qty * price * FEE_RATE
-            spend = qty * price + fee
+            if self.in_cooldown(symbol):
+                return False
+            if self.cash < MIN_TRADE_CASH:
+                return False
 
-        self.cash -= spend
-        max_stop_pct = params["max_stop_pct"]
-        stop = max(price - params["atr_stop_mult"] * atr, price * (1 + max_stop_pct))
-        stop = min(stop, price * (1 + MIN_STOP_DIST_PCT))
-        target = max(price + params["atr_target_mult"] * atr, price * (1 + MIN_TARGET_PCT))
-        target = min(target, price * (1 + MAX_TARGET_PCT))
-        self.positions[symbol] = {
-            "qty": qty, "entry": price, "opened": time.time(),
-            "high": price, "stop": stop, "target": target,
-        }
-        prefix = "[LIVE] " if self.executor is not None else ""
-        self.db.execute(
-            "INSERT INTO trades (ts, symbol, side, qty, price, value, fee, pnl, pnl_pct, reason) "
-            "VALUES (?,?,?,?,?,?,?,NULL,NULL,?)",
-            (time.time(), symbol, "BUY", qty, price, spend, fee, prefix + reason))
-        self._save()
-        return True
+            equity = self.equity(prices)
+            stop, target = compute_bracket(price, atr, params)
+
+            # Equal-risk sizing: every position stands to lose the same
+            # fraction of equity if its initial stop is hit. Volatile coins
+            # (wide stops) get small positions, calm coins get larger ones —
+            # capped by position_fraction so one calm coin can't dominate.
+            spend = compute_spend(equity, self.cash, price, stop, params)
+            fee = spend * FEE_RATE
+            qty = (spend - fee) / price
+
+            if self.executor is not None:  # live: place the real order first
+                try:
+                    qty = self.executor.execute("buy", meta or {}, qty, price)
+                except Exception as e:
+                    self._log_order_failure(symbol, "BUY", str(e))
+                    return False
+                fee = qty * price * FEE_RATE
+                spend = qty * price + fee
+
+            self.cash -= spend
+            self.positions[symbol] = {
+                "qty": qty, "entry": price, "opened": time.time(),
+                "high": price, "stop": stop, "target": target,
+            }
+            prefix = "[LIVE] " if self.executor is not None else ""
+            self.db.execute(
+                "INSERT INTO trades (ts, symbol, side, qty, price, value, fee, pnl, pnl_pct, reason) "
+                "VALUES (?,?,?,?,?,?,?,NULL,NULL,?)",
+                (time.time(), symbol, "BUY", qty, price, spend, fee, prefix + reason))
+            self._save()
+            return True
 
     def sell(self, symbol: str, price: float, reason: str, meta: dict | None = None) -> float | None:
-        pos = self.positions.get(symbol)
-        if not pos:
-            return None
+        with self._lock:
+            pos = self.positions.get(symbol)
+            if not pos:
+                return None
 
-        if self.executor is not None:  # live: the real order must succeed before we close the book
-            try:
-                self.executor.execute("sell", meta or {}, pos["qty"], price)
-            except Exception as e:
-                self._log_order_failure(symbol, "SELL", str(e))
-                return None  # position stays open; exit re-triggers next cycle
+            if self.executor is not None:  # live: the real order must succeed before we close the book
+                try:
+                    self.executor.execute("sell", meta or {}, pos["qty"], price)
+                except Exception as e:
+                    self._log_order_failure(symbol, "SELL", str(e))
+                    return None  # position stays open; exit re-triggers next cycle
 
-        self.positions.pop(symbol)
-        gross = pos["qty"] * price
-        fee = gross * FEE_RATE
-        proceeds = gross - fee
-        cost = pos["qty"] * pos["entry"]
-        pnl = proceeds - cost
-        pnl_pct = (pnl / cost) * 100.0 if cost else 0.0
-        self.cash += proceeds
-        self.last_exit[symbol] = time.time()
-        prefix = "[LIVE] " if self.executor is not None else ""
-        self.db.execute(
-            "INSERT INTO trades (ts, symbol, side, qty, price, value, fee, pnl, pnl_pct, reason) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (time.time(), symbol, "SELL", pos["qty"], price, gross, fee, pnl, pnl_pct, prefix + reason))
-        self._save()
-        return pnl
+            self.positions.pop(symbol)
+            gross = pos["qty"] * price
+            fee = gross * FEE_RATE
+            proceeds = gross - fee
+            cost = pos["qty"] * pos["entry"]
+            pnl = proceeds - cost
+            pnl_pct = (pnl / cost) * 100.0 if cost else 0.0
+            self.cash += proceeds
+            self.last_exit[symbol] = time.time()
+            prefix = "[LIVE] " if self.executor is not None else ""
+            self.db.execute(
+                "INSERT INTO trades (ts, symbol, side, qty, price, value, fee, pnl, pnl_pct, reason) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), symbol, "SELL", pos["qty"], price, gross, fee, pnl, pnl_pct, prefix + reason))
+            self._save()
+            return pnl
+
+    # ---------- daily circuit breaker ----------
+
+    def circuit_breaker(self, equity: float, max_daily_loss: float) -> dict:
+        """Daily drawdown kill switch. Anchors equity at the first check of
+        each UTC day; if equity falls more than max_daily_loss below the
+        anchor, new BUYS are blocked until the next UTC day. Exits, stops,
+        and manual closes are never blocked — the breaker only stops the bot
+        from digging the hole deeper."""
+        with self._lock:
+            today = time.strftime("%Y-%m-%d", time.gmtime())
+            raw = self.kv_get("day_anchor")
+            anchor = json.loads(raw) if raw else None
+            if not anchor or anchor.get("date") != today:
+                anchor = {"date": today, "equity": equity}
+                self.kv_set("day_anchor", json.dumps(anchor))
+            day_start = anchor["equity"] or equity
+            drawdown = (equity / day_start - 1.0) if day_start else 0.0
+
+            tripped_day = self.kv_get("breaker_day")
+            tripped = tripped_day == today
+            if not tripped and drawdown <= -max_daily_loss:
+                self.kv_set("breaker_day", today)
+                tripped = True
+            return {
+                "tripped": tripped,
+                "day_start_equity": day_start,
+                "daily_drawdown_pct": drawdown * 100.0,
+                "limit_pct": -max_daily_loss * 100.0,
+            }
 
     def _log_order_failure(self, symbol: str, side: str, error: str):
         self.kv_set("last_order_error", json.dumps(
@@ -172,66 +261,64 @@ class PaperTrader:
         only ever tightens (chandelier exit, locks in gains as price rises);
         the target only extends further while `trend_ok` (trend still holding),
         and otherwise freezes rather than pulling back."""
-        pos = self.positions.get(symbol)
-        if not pos or not atr:
-            return
-        params = strategy.PARAMS
-        pos["high"] = max(pos["high"], price)
-        floor_stop = pos["entry"] * (1 + params["max_stop_pct"])
-        candidate_stop = pos["high"] - params["atr_stop_mult"] * atr
-        ceiling_stop = price * (1 + MIN_STOP_DIST_PCT)
-        pos["stop"] = min(max(pos["stop"], candidate_stop, floor_stop), ceiling_stop)
-        if trend_ok:
-            candidate_target = price + params["atr_target_mult"] * atr
-            max_target = price * (1 + MAX_TARGET_PCT)
-            pos["target"] = min(max(pos["target"], candidate_target), max_target)
-        self._save()
+        with self._lock:
+            pos = self.positions.get(symbol)
+            if not pos or not atr:
+                return
+            trail_stop_target(pos, price, atr, trend_ok, strategy.PARAMS)
+            self._save()
 
     def check_exits(self, prices: dict[str, float], universe: dict[str, dict] | None = None) -> list[str]:
         """Adaptive stop-loss / take-profit sweep. Returns human-readable actions."""
-        actions = []
-        universe = universe or {}
-        for symbol in list(self.positions):
-            price = prices.get(symbol)
-            if not price:
-                continue
-            pos = self.positions[symbol]
-            ret = price / pos["entry"] - 1.0
-            if price <= pos["stop"]:
-                if self.sell(symbol, price, f"Trailing stop hit at ${pos['stop']:,.4f} ({ret * 100:+.1f}% from entry)",
-                             universe.get(symbol)) is not None:
-                    actions.append(f"Stop-loss closed {symbol} at ${price:,.2f} ({ret * 100:+.1f}%)")
-            elif price >= pos["target"]:
-                if self.sell(symbol, price, f"Take-profit target hit at ${pos['target']:,.4f} ({ret * 100:+.1f}% from entry)",
-                             universe.get(symbol)) is not None:
-                    actions.append(f"Take-profit closed {symbol} at ${price:,.2f} ({ret * 100:+.1f}%)")
-        return actions
+        with self._lock:
+            actions = []
+            universe = universe or {}
+            for symbol in list(self.positions):
+                price = prices.get(symbol)
+                if not price:
+                    continue
+                pos = self.positions[symbol]
+                ret = price / pos["entry"] - 1.0
+                if price <= pos["stop"]:
+                    if self.sell(symbol, price, f"Trailing stop hit at ${pos['stop']:,.4f} ({ret * 100:+.1f}% from entry)",
+                                 universe.get(symbol)) is not None:
+                        actions.append(f"Stop-loss closed {symbol} at ${price:,.2f} ({ret * 100:+.1f}%)")
+                elif price >= pos["target"]:
+                    if self.sell(symbol, price, f"Take-profit target hit at ${pos['target']:,.4f} ({ret * 100:+.1f}% from entry)",
+                                 universe.get(symbol)) is not None:
+                        actions.append(f"Take-profit closed {symbol} at ${price:,.2f} ({ret * 100:+.1f}%)")
+            return actions
 
     # ---------- reporting ----------
 
     def record_equity(self, prices: dict[str, float]):
-        self.db.execute("INSERT INTO equity (ts, value) VALUES (?, ?)",
-                        (time.time(), self.equity(prices)))
-        self.db.commit()
+        with self._lock:
+            self.db.execute("INSERT INTO equity (ts, value) VALUES (?, ?)",
+                            (time.time(), self.equity(prices)))
+            self.db.commit()
 
     def equity_history(self, limit: int = 600) -> list[list[float]]:
-        rows = self.db.execute(
-            "SELECT ts, value FROM equity ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
-        return [[r[0], r[1]] for r in reversed(rows)]
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT ts, value FROM equity ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+            return [[r[0], r[1]] for r in reversed(rows)]
 
     def recent_trades(self, limit: int = 60) -> list[dict]:
-        rows = self.db.execute(
-            "SELECT ts, symbol, side, qty, price, value, fee, pnl, pnl_pct, reason "
-            "FROM trades ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
-        keys = ["ts", "symbol", "side", "qty", "price", "value", "fee", "pnl", "pnl_pct", "reason"]
-        return [dict(zip(keys, r)) for r in rows]
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT ts, symbol, side, qty, price, value, fee, pnl, pnl_pct, reason "
+                "FROM trades ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+            keys = ["ts", "symbol", "side", "qty", "price", "value", "fee", "pnl", "pnl_pct", "reason"]
+            return [dict(zip(keys, r)) for r in rows]
 
     def realized_pnl(self) -> float:
-        row = self.db.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='SELL'").fetchone()
-        return row[0]
+        with self._lock:
+            row = self.db.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='SELL'").fetchone()
+            return row[0]
 
     def trades_for(self, symbol: str, since_ts: float) -> list[dict]:
-        rows = self.db.execute(
-            "SELECT ts, side, price FROM trades WHERE symbol=? AND ts>=? ORDER BY ts",
-            (symbol, since_ts)).fetchall()
-        return [{"ts": r[0], "side": r[1], "price": r[2]} for r in rows]
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT ts, side, price FROM trades WHERE symbol=? AND ts>=? ORDER BY ts",
+                (symbol, since_ts)).fetchall()
+            return [{"ts": r[0], "side": r[1], "price": r[2]} for r in rows]

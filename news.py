@@ -79,6 +79,15 @@ def _score_text(text: str) -> float:
     return max(-100.0, min(100.0, raw * 22.0))
 
 
+_tag_re = re.compile(r"<[^>]+>")
+
+# Terms that move a specific coin hard when the story is actually about it —
+# a protocol hack is not the same magnitude as generic "price slides" news.
+SEVERE_TERMS = re.compile(
+    r"\b(hack(ed)?|exploit(ed)?|stolen|theft|drained|bankruptcy|insolven\w*|fraud|seized|rug pull"
+    r"|delist(ed|ing)?|approval|approves|record high|all-time high)\b", re.I)
+
+
 def _parse_feed(source: str, xml_text: str) -> list[dict]:
     items = []
     root = ET.fromstring(xml_text)
@@ -87,6 +96,7 @@ def _parse_feed(source: str, xml_text: str) -> list[dict]:
         if not title:
             continue
         link = (item.findtext("link") or "").strip()
+        desc = _tag_re.sub(" ", item.findtext("description") or "").strip()[:400]
         ts = time.time()
         pub = item.findtext("pubDate")
         if pub:
@@ -94,8 +104,15 @@ def _parse_feed(source: str, xml_text: str) -> list[dict]:
                 ts = parsedate_to_datetime(pub).timestamp()
             except Exception:
                 pass
-        items.append({"title": title, "link": link, "source": source, "ts": ts})
+        items.append({"title": title, "desc": desc, "link": link, "source": source, "ts": ts})
     return items
+
+
+def _dedupe_key(title: str) -> str:
+    """Near-duplicate key: first 8 significant lowercase words. Catches the
+    same story syndicated across feeds with minor title tweaks."""
+    words = re.findall(r"[a-z0-9$]+", title.lower())
+    return " ".join(w for w in words if len(w) > 2)[:120][: 8 * 12] or title.lower()
 
 
 def fetch_headlines(patterns: dict[str, tuple], max_age_hours: float = 48.0) -> list[dict]:
@@ -111,12 +128,18 @@ def fetch_headlines(patterns: dict[str, tuple], max_age_hours: float = 48.0) -> 
         except Exception:
             continue
         for it in items:
-            key = it["title"].lower()
+            key = _dedupe_key(it["title"])
             if key in seen or now - it["ts"] > max_age_hours * 3600:
                 continue
             seen.add(key)
-            sent = _score_text(it["title"])
+            # title carries full weight; description adds color at half weight
+            sent = _score_text(it["title"]) + 0.5 * _score_text(it.get("desc", ""))
+            sent = max(-100.0, min(100.0, sent))
             coins = _coin_matches(patterns, it["title"])
+            # a severe event (hack, bankruptcy, ETF approval...) about a
+            # SPECIFIC coin hits that coin far harder than generic market news
+            if coins and SEVERE_TERMS.search(it["title"]):
+                sent = max(-100.0, min(100.0, sent * 1.5))
             it.update({
                 "sentiment": sent,
                 "coins": coins,

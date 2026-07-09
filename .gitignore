@@ -6,3 +6,5 @@ cryptopilot.db
 .env
 *.key
 secrets*
+bot.log
+bot.err.log

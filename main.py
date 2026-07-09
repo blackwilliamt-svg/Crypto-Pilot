@@ -18,10 +18,13 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import analytics
+import backtest
 import exchange
 import indicators
 import market
 import news
+import regime
 import strategy
 from trader import PaperTrader, MIN_TRADE_CASH, START_CASH
 
@@ -64,6 +67,9 @@ _last_4h = 0.0
 _last_1d = 0.0
 PAUSED = False
 MODE = "paper"  # "paper" | "live" — never defaults to live
+REGIME: dict = {"name": "neutral", "btc_bias": 0.0, "breadth": 0.5}
+BREAKER: dict = {"tripped": False, "daily_drawdown_pct": 0.0, "limit_pct": 0.0}
+MAX_ENTRIES_PER_CYCLE = 2  # don't deploy the whole bankroll in one 45s burst
 TRADE_LOCK = threading.Lock()  # guards trader mutations (cycle thread vs API endpoints)
 TRADER = PaperTrader(str(ROOT / "cryptopilot.db"))
 
@@ -162,7 +168,7 @@ def _build_summary(signals, actions, prices, headlines):
 
 
 def _cycle():
-    global STATE, _last_1h, _last_4h, _last_1d
+    global STATE, REGIME, BREAKER, _last_1h, _last_4h, _last_1d
     if not UNIVERSE or time.time() - _last_universe > UNIVERSE_REFRESH_SECONDS:
         _refresh_universe()
     _refresh_candles()
@@ -177,6 +183,11 @@ def _cycle():
         _last_1d = time.time()
     if time.time() - _last_news > NEWS_REFRESH_SECONDS:
         _refresh_news()
+
+    # Market regime: BTC trend + breadth decide how defensive to be. Applied
+    # through strategy params (stricter entries / smaller risk when risk_off).
+    REGIME = regime.compute(CANDLES_4H.get("BTC", []), CANDLES_1D.get("BTC", []), CANDLES)
+    strategy.set_regime(REGIME["name"])
 
     headlines = HEADLINES
     prices, atrs, signals = {}, {}, []
@@ -218,6 +229,9 @@ def _cycle():
     signals.sort(key=lambda s: s["total"], reverse=True)
 
     actions = []
+    # Daily circuit breaker: blocks NEW buys after a bad day; exits, stops
+    # and manual closes always keep working.
+    BREAKER = TRADER.circuit_breaker(TRADER.equity(prices), strategy.PARAMS["daily_max_loss"])
     if not PAUSED:
         with TRADE_LOCK:
             for s in signals:  # adapt each open position's stop/target to latest price + volatility
@@ -235,14 +249,23 @@ def _cycle():
                     if pnl is not None:
                         actions.append(f"Sold {sym} at ${s['price']:,.2f} on bearish signal (P&L {pnl:+,.2f} USD).")
 
-            for s in signals:  # entries, best score first
-                sym = s["symbol"]
-                if s["total"] < strategy.PARAMS["buy_threshold"] or sym in TRADER.positions:
-                    continue
-                reason = (f"Score {s['total']:+.0f} (TA {s['ta']:+.0f} / news {s['news']:+.0f}): "
-                          + "; ".join(s["reasons"][:3]))
-                if TRADER.buy(sym, s["price"], reason[:220], prices, atrs.get(sym, 0.0), UNIVERSE.get(sym)):
-                    actions.append(f"Opened {sym} at ${s['price']:,.2f} (signal {s['total']:+.0f}).")
+            opened = 0
+            if BREAKER["tripped"]:
+                actions.append(
+                    f"Circuit breaker active: down {BREAKER['daily_drawdown_pct']:.1f}% today "
+                    f"(limit {BREAKER['limit_pct']:.0f}%) — no new entries until tomorrow (UTC).")
+            else:
+                for s in signals:  # entries, best score first, throttled per cycle
+                    sym = s["symbol"]
+                    if opened >= MAX_ENTRIES_PER_CYCLE:
+                        break
+                    if s["total"] < strategy.PARAMS["buy_threshold"] or sym in TRADER.positions:
+                        continue
+                    reason = (f"Score {s['total']:+.0f} (TA {s['ta']:+.0f} / news {s['news']:+.0f}): "
+                              + "; ".join(s["reasons"][:3]))
+                    if TRADER.buy(sym, s["price"], reason[:220], prices, atrs.get(sym, 0.0), UNIVERSE.get(sym)):
+                        actions.append(f"Opened {sym} at ${s['price']:,.2f} (signal {s['total']:+.0f}).")
+                        opened += 1
 
     for s in signals:
         sym = s["symbol"]
@@ -251,7 +274,9 @@ def _cycle():
             ret = (s["price"] / pos["entry"] - 1.0) * 100.0
             s["action"] = f"Holding since ${pos['entry']:,.2f} ({ret:+.1f}%)"
         elif s["total"] >= strategy.PARAMS["buy_threshold"]:
-            if len(TRADER.positions) >= strategy.PARAMS["max_positions"]:
+            if BREAKER["tripped"]:
+                s["action"] = "Buy signal — halted (daily loss breaker)"
+            elif len(TRADER.positions) >= strategy.PARAMS["max_positions"]:
                 s["action"] = "Buy signal — blocked (max positions)"
             elif TRADER.cash < MIN_TRADE_CASH:
                 s["action"] = "Buy signal — blocked (low cash)"
@@ -265,6 +290,32 @@ def _cycle():
             s["action"] = "Monitoring"
 
     TRADER.record_equity(prices)
+
+    snapshot = {
+        "status": "paused" if PAUSED else "live",
+        "error": None,
+        "updated_at": time.time(),
+        "paused": PAUSED,
+        # mode/style/live_ready/last_order_error/paused/status/portfolio/
+        # positions/trades are overlaid live in api_state() below, from
+        # current prices rather than this cycle's — a manual close/reset
+        # shouldn't be invisible on the dashboard for up to a cycle length.
+        "signals": signals,
+        "headlines": [
+            {"title": h["title"], "link": h["link"], "source": h["source"], "ts": h["ts"],
+             "sentiment": h["sentiment"], "label": h["label"], "coins": h["coins"]}
+            for h in headlines[:40]
+        ],
+        "summary": _build_summary(signals, actions, prices, headlines),
+    }
+    with LOCK:
+        STATE = snapshot
+
+
+def _portfolio_snapshot(prices: dict[str, float]) -> dict:
+    """Portfolio + open-positions view priced at `prices`. Cheap (no network
+    calls) — safe to rebuild on every /api/state request so a manual
+    close/reset/trade is reflected immediately, not just on the next cycle."""
     equity = TRADER.equity(prices)
     realized = TRADER.realized_pnl()
     unrealized = sum(
@@ -281,16 +332,7 @@ def _cycle():
             "opened": p["opened"],
             "stop": p["stop"], "target": p["target"],
         })
-
-    snapshot = {
-        "status": "paused" if PAUSED else "live",
-        "error": None,
-        "updated_at": time.time(),
-        "paused": PAUSED,
-        "mode": MODE,
-        "style": strategy.ACTIVE_STYLE,
-        "live_ready": exchange.credentials_present(),
-        "last_order_error": TRADER.last_order_error(),
+    return {
         "portfolio": {
             "equity": equity, "cash": TRADER.cash, "start_cash": START_CASH,
             "positions_value": equity - TRADER.cash,
@@ -300,17 +342,17 @@ def _cycle():
             "equity_history": TRADER.equity_history(),
         },
         "positions": positions,
-        "signals": signals,
-        "trades": TRADER.recent_trades(),
-        "headlines": [
-            {"title": h["title"], "link": h["link"], "source": h["source"], "ts": h["ts"],
-             "sentiment": h["sentiment"], "label": h["label"], "coins": h["coins"]}
-            for h in headlines[:40]
-        ],
-        "summary": _build_summary(signals, actions, prices, headlines),
     }
-    with LOCK:
-        STATE = snapshot
+
+
+def _latest_prices() -> dict[str, float]:
+    """Latest known close per open-position symbol, from in-memory 15m
+    candles — no network call, just whatever the last cycle already fetched."""
+    prices = {}
+    for sym, pos in TRADER.positions.items():
+        candles = CANDLES_15M.get(sym)
+        prices[sym] = candles[-1]["c"] if candles else pos["entry"]
+    return prices
 
 
 def _loop():
@@ -332,7 +374,23 @@ def index():
 @app.get("/api/state")
 def api_state():
     with LOCK:
-        return copy.deepcopy(STATE)
+        snapshot = copy.deepcopy(STATE)
+    # mode/style/live_ready/paused/portfolio/positions/trades are cheap to
+    # read live and safety/trust-relevant (esp. the paper/live badge and
+    # position list after a manual close) — don't let them lag behind the
+    # cycle cache, which only refreshes once per CYCLE_SECONDS.
+    snapshot["mode"] = MODE
+    snapshot["style"] = strategy.ACTIVE_STYLE
+    snapshot["regime"] = REGIME
+    snapshot["breaker"] = BREAKER
+    snapshot["live_ready"] = exchange.credentials_present()
+    snapshot["last_order_error"] = TRADER.last_order_error()
+    snapshot["paused"] = PAUSED
+    if snapshot.get("status") in ("live", "paused"):
+        snapshot["status"] = "paused" if PAUSED else "live"
+    snapshot.update(_portfolio_snapshot(_latest_prices()))
+    snapshot["trades"] = TRADER.recent_trades()
+    return snapshot
 
 
 @app.get("/api/coin/{symbol}")
@@ -389,6 +447,29 @@ def api_close_position(symbol: str):
         err = TRADER.last_order_error() or {}
         raise HTTPException(502, f"exchange order failed: {err.get('error', 'unknown error')}")
     return {"ok": True, "symbol": symbol, "price": price, "pnl": pnl}
+
+
+@app.get("/api/analytics")
+def api_analytics():
+    return analytics.compute(TRADER.recent_trades(2000), TRADER.equity_history(5000), START_CASH)
+
+
+@app.post("/api/backtest")
+def api_backtest_start(payload: dict = Body(default={})):
+    style = str(payload.get("style") or strategy.ACTIVE_STYLE).lower()
+    if style not in strategy.STYLES:
+        raise HTTPException(400, f"unknown style; pick one of {list(strategy.STYLES)}")
+    days = max(2, min(28, int(payload.get("days") or 21)))
+    if not CANDLES:
+        raise HTTPException(409, "candle history still loading — try again shortly")
+    if not backtest.start(CANDLES, CANDLES_4H, CANDLES_1D, UNIVERSE, style, days):
+        raise HTTPException(409, "a backtest is already running")
+    return {"ok": True}
+
+
+@app.get("/api/backtest")
+def api_backtest_status():
+    return backtest.status()
 
 
 @app.post("/api/style")

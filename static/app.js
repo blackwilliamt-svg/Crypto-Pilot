@@ -58,6 +58,17 @@ function renderHeader(st) {
   const sel = $("style-select");
   if (st.style && document.activeElement !== sel) sel.value = st.style;
 
+  const rp = $("regime-pill");
+  if (st.regime) {
+    rp.classList.remove("hidden");
+    const names = { risk_on: "RISK-ON", neutral: "NEUTRAL", risk_off: "RISK-OFF" };
+    $("regime-text").textContent =
+      `${names[st.regime.name] || st.regime.name} · breadth ${Math.round((st.regime.breadth || 0) * 100)}%`;
+    rp.className = "status-pill regime " + st.regime.name;
+    rp.title = "Market regime from BTC trend + % of coins above their 1h EMA50. " +
+      "Risk-off tightens entries and halves risk per trade.";
+  }
+
   if (st.portfolio) {
     $("h-equity").textContent = fmtMoney(st.portfolio.equity);
     const pnl = st.portfolio.total_pnl;
@@ -104,6 +115,19 @@ function renderPortfolio(st) {
     btn.addEventListener("click", () => closePosition(btn.dataset.close)));
   $("positions-empty").classList.toggle("hidden", (st.positions || []).length > 0);
   drawSpark(p.equity_history || [], p.start_cash);
+
+  const exposure = p.equity > 0 ? (p.positions_value / p.equity) * 100 : 0;
+  const b = st.breaker || {};
+  const dd = b.daily_drawdown_pct || 0;
+  $("risk-line").innerHTML =
+    `<span>Exposure <b>${exposure.toFixed(0)}%</b> of equity</span>` +
+    `<span>Today <b class="${pnlClass(dd)}">${fmtPct(dd)}</b>` +
+    `<span class="muted"> (breaker at ${(b.limit_pct || 0).toFixed(0)}%)</span></span>` +
+    `<span>Risk/trade <span class="muted">equal-risk sized</span></span>`;
+  const bb = $("breaker-banner");
+  bb.classList.toggle("hidden", !b.tripped);
+  if (b.tripped) bb.textContent =
+    `⛔ Daily loss breaker tripped (${fmtPct(dd)} today) — no new entries until tomorrow UTC. Exits still active.`;
 }
 
 async function closePosition(sym) {
@@ -276,6 +300,117 @@ function drawChart(d) {
   });
 }
 
+/* ---------- performance analytics ---------- */
+
+function statBox(label, value, cls = "") {
+  return `<div class="pstat"><div class="l">${label}</div><div class="v ${cls}">${value}</div></div>`;
+}
+
+async function pollAnalytics() {
+  let a;
+  try {
+    const r = await fetch("/api/analytics");
+    a = await r.json();
+  } catch { return; }
+  if (!a || a.closed_trades === 0) {
+    $("analytics-note").textContent = "no closed trades yet";
+    $("analytics-stats").innerHTML = "";
+    $("analytics-coins").textContent = "";
+    return;
+  }
+  $("analytics-note").textContent = `${a.closed_trades} closed trades`;
+  const pf = a.profit_factor == null ? "—" :
+    (a.profit_factor === null ? "—" : (isFinite(a.profit_factor) ? a.profit_factor.toFixed(2) : "∞"));
+  const streak = a.current_streak > 0 ? `${a.current_streak}W` :
+    (a.current_streak < 0 ? `${-a.current_streak}L` : "—");
+  $("analytics-stats").innerHTML =
+    statBox("Win rate", a.win_rate == null ? "—" : a.win_rate.toFixed(0) + "%") +
+    statBox("Profit factor", pf, a.profit_factor >= 1 ? "pos" : "neg") +
+    statBox("Expectancy", a.expectancy == null ? "—" : fmtMoney(a.expectancy, true) + "/trade",
+      pnlClass(a.expectancy || 0)) +
+    statBox("Max drawdown", a.max_drawdown_pct.toFixed(1) + "%", "neg") +
+    statBox("Sharpe (approx)", a.sharpe_approx == null ? "—" : a.sharpe_approx.toFixed(2)) +
+    statBox("Avg hold", a.avg_hold_hours == null ? "—" : a.avg_hold_hours.toFixed(1) + "h") +
+    statBox("Streak", streak, a.current_streak >= 0 ? "pos" : "neg") +
+    statBox("Fees paid", fmtMoney(a.total_fees));
+  const fmtCoins = (list) => list.map(([sym, pnl]) =>
+    `${sym} <b class="${pnlClass(pnl)}">${fmtMoney(pnl, true)}</b>`).join(" · ");
+  $("analytics-coins").innerHTML =
+    (a.best_coins.length ? "Best: " + fmtCoins(a.best_coins) : "") +
+    (a.worst_coins.length ? " &nbsp;|&nbsp; Worst: " + fmtCoins(a.worst_coins) : "");
+}
+
+/* ---------- backtest ---------- */
+
+let btPolling = null;
+
+function renderBacktest(job) {
+  const stats = $("bt-stats"), curve = $("bt-curve"), status = $("bt-status");
+  if (job.status === "running") {
+    status.textContent = `Running… ${Math.round((job.progress || 0) * 100)}%`;
+    return;
+  }
+  if (job.status === "error") {
+    status.textContent = "Backtest failed: " + job.error;
+    return;
+  }
+  if (job.status !== "done" || !job.result) return;
+  clearInterval(btPolling); btPolling = null;
+  const r = job.result, s = r.stats;
+  status.innerHTML = `<b>${esc(r.style)}</b> · ${r.days}d · ${r.coins_tested} coins — ` +
+    `return <b class="${pnlClass(r.return_pct)}">${fmtPct(r.return_pct)}</b>` +
+    (r.btc_hold_return_pct == null ? "" :
+      ` vs BTC hold <b class="${pnlClass(r.btc_hold_return_pct)}">${fmtPct(r.btc_hold_return_pct)}</b>`) +
+    ` <span class="muted">· ${esc(r.notes)}</span>`;
+  stats.classList.remove("hidden");
+  const pf = s.profit_factor == null ? "—" : (isFinite(s.profit_factor) ? s.profit_factor.toFixed(2) : "∞");
+  stats.innerHTML =
+    statBox("Final equity", fmtMoney(r.final_equity), pnlClass(r.return_pct)) +
+    statBox("Trades", s.closed_trades) +
+    statBox("Win rate", s.win_rate == null ? "—" : s.win_rate.toFixed(0) + "%") +
+    statBox("Profit factor", pf) +
+    statBox("Max drawdown", s.max_drawdown_pct.toFixed(1) + "%", "neg") +
+    statBox("Expectancy", s.expectancy == null ? "—" : fmtMoney(s.expectancy, true), pnlClass(s.expectancy || 0));
+  // equity curve
+  curve.classList.remove("hidden");
+  const ctx = curve.getContext("2d");
+  ctx.clearRect(0, 0, curve.width, curve.height);
+  const vals = (r.equity_curve || []).map((p) => p[1]);
+  if (vals.length < 2) return;
+  const min = Math.min(...vals, r.start_cash), max = Math.max(...vals, r.start_cash);
+  const pad = (max - min) * 0.08 || 1;
+  const y = (v) => curve.height - 4 - ((v - min + pad) / (max - min + 2 * pad)) * (curve.height - 8);
+  const x = (i) => 2 + (i / (vals.length - 1)) * (curve.width - 4);
+  ctx.strokeStyle = "#2c3a52"; ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(0, y(r.start_cash)); ctx.lineTo(curve.width, y(r.start_cash)); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.strokeStyle = vals[vals.length - 1] >= r.start_cash ? "#34d399" : "#f87171";
+  ctx.lineWidth = 1.6; ctx.beginPath();
+  vals.forEach((v, i) => (i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v))));
+  ctx.stroke();
+}
+
+$("bt-run").addEventListener("click", async () => {
+  const r = await fetch("/api/backtest", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ style: $("bt-style").value, days: parseInt($("bt-days").value, 10) }),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    $("bt-status").textContent = "Could not start: " + (err.detail || r.statusText);
+    return;
+  }
+  $("bt-status").textContent = "Running… 0%";
+  if (btPolling) clearInterval(btPolling);
+  btPolling = setInterval(async () => {
+    try {
+      const jr = await fetch("/api/backtest");
+      renderBacktest(await jr.json());
+    } catch { /* keep polling */ }
+  }, 2000);
+});
+
 /* ---------- polling + controls ---------- */
 
 async function poll() {
@@ -354,3 +489,5 @@ $("modal").addEventListener("click", (e) => {
 
 poll();
 setInterval(poll, 5000);
+pollAnalytics();
+setInterval(pollAnalytics, 30000);

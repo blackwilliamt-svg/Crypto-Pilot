@@ -41,6 +41,20 @@ h1 { font-size: 19px; font-weight: 600; letter-spacing: .3px; }
 .style-select { padding: 4px 8px; font-size: 12px; }
 .btn-close { padding: 3px 10px; font-size: 11px; }
 .btn-close:hover { border-color: var(--red); color: var(--red); }
+
+.status-pill.regime { font-size: 10px; }
+.status-pill.regime.risk_on { color: var(--green); border-color: var(--green); }
+.status-pill.regime.neutral { color: var(--amber); border-color: var(--amber); }
+.status-pill.regime.risk_off { color: var(--red); border-color: var(--red); }
+
+.risk-line {
+  display: flex; gap: 18px; flex-wrap: wrap;
+  font-size: 12px; color: var(--text);
+  padding: 6px 2px 2px; border-top: 1px solid var(--border); margin-top: 8px;
+}
+.bt-controls { display: flex; gap: 6px; align-items: center; }
+.analytics-coins { font-size: 12px; margin-top: 8px; }
+#bt-curve { width: 100%; margin-top: 8px; }
 .header-stats { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
 .hstat { display: flex; flex-direction: column; align-items: flex-end; }
 .hstat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }

@@ -27,22 +27,46 @@ coins by market cap). Typically ~100-150 coins.
 
 Each cycle (every 45 seconds), for every coin in the universe:
 
-1. **Technical score (70% weight)** from 15-minute Kraken candles:
-   RSI(14) overbought/oversold, MACD(12,26,9) crossovers and momentum,
-   EMA20/EMA50 trend, Bollinger band position, 2.5-hour rate of change —
-   then adjusted up to ±15 points by trend alignment on the higher
-   timeframes (1h 50% / 4h 30% / 1d 20%), so trades with the larger trend
-   get boosted and counter-trend setups get penalized.
-2. **News score (30% weight)**: headlines from CoinDesk, Cointelegraph, Decrypt,
-   CryptoSlate, and Bitcoin Magazine RSS feeds are scored with a bullish/bearish
-   keyword lexicon, matched to coins, and recency-weighted (8-hour half-life).
-   Market-wide news bleeds into every coin at reduced weight.
-3. **Combined signal** (−100…+100): crossing the buy threshold opens a position,
-   crossing the sell threshold closes one. Stops and targets are adaptive: sized
-   off each coin's hourly ATR, with the stop trailing price upward
-   chandelier-style (only ever tightens) and the target extending while the
-   trend holds. A per-coin re-entry cooldown prevents fast-signal churn.
-   Positions can also be closed manually from the dashboard at any time.
+1. **Technical score** from 15-minute Kraken candles: RSI(14), MACD(12,26,9)
+   crossovers/momentum, EMA20/EMA50 trend, Bollinger position, rate of change,
+   Stochastic RSI turns, and volume-surge confirmation — with trend-following
+   components **scaled by ADX** so EMA/MACD signals are discounted in choppy
+   markets where they mostly whipsaw. The score is then adjusted up to ±15
+   points by trend alignment on higher timeframes (1h 50% / 4h 30% / 1d 20%).
+2. **News score**: headlines + descriptions from CoinDesk, Cointelegraph,
+   Decrypt, CryptoSlate, and Bitcoin Magazine RSS feeds, scored with a
+   bullish/bearish lexicon, near-duplicate-deduped, matched to coins, and
+   recency-weighted (8-hour half-life). Severe coin-specific events (hacks,
+   bankruptcies, approvals) hit that coin 1.5x harder. Market-wide news bleeds
+   into every coin at reduced weight.
+3. **Market regime overlay**: BTC 4h/1d trend + market breadth (% of coins
+   above their 1h EMA50) classify the market as risk-on / neutral / risk-off.
+   Risk-off raises the entry bar by 10 points, halves risk per trade, and cuts
+   max positions — exits are never restricted.
+4. **Combined signal** (−100…+100): crossing the buy threshold opens a position
+   (max 2 new entries per cycle), crossing the sell threshold closes one.
+5. **Risk engine**: positions are **equal-risk sized** — each stands to lose
+   the same fraction of equity if its initial stop is hit, so volatile coins
+   get small positions and calm coins larger ones (capped by a max notional
+   fraction). Stops/targets are ATR-adaptive: the stop trails price upward
+   chandelier-style (only ever tightens), the target extends while the trend
+   holds. A **daily circuit breaker** halts new buys (never exits) if equity
+   drops more than the style's daily loss limit, until the next UTC day.
+   Per-coin re-entry cooldowns prevent churn; positions can always be closed
+   manually from the dashboard.
+
+## Analytics & backtesting
+
+- **Performance panel**: win rate, profit factor, expectancy per trade, max
+  drawdown, approximate Sharpe, average hold time, streak, best/worst coins —
+  computed from the live trade log (`GET /api/analytics`).
+- **Backtester**: replays the exact live strategy code (same indicator,
+  bracket, sizing, and trailing functions) over the stored ~30 days of hourly
+  candles for the top 40 coins by market cap, from the dashboard or
+  `POST /api/backtest {"style": "...", "days": N}`. TA-only — historical news
+  isn't available, and the regime overlay/circuit breaker aren't simulated —
+  and 1h bars can't see intra-hour stop hits, so treat results as directional,
+  not gospel.
 
 ## Trading styles
 
@@ -51,11 +75,17 @@ Switchable live from the dashboard header (persisted across restarts):
 | | Conservative | Balanced | Aggressive (default) |
 |---|---|---|---|
 | Entry / exit threshold | +38 / −28 | +30 / −25 | +24 / −18 |
-| Max positions × size | 4 × 15% | 5 × 18% | 8 × 12% |
+| Max positions (notional cap) | 4 (20%) | 5 (22%) | 8 (25%) |
+| Risk per trade | 1.0% | 1.5% | 2.0% |
+| Daily loss breaker | −2% | −3% | −4% |
 | ATR stop / target mult | 2.5× / 3.5× | 2.0× / 3.0× | 1.8× / 2.8× |
-| Max risk per position | −6% | −10% | −10% |
+| Max stop distance | −6% | −10% | −10% |
 | Re-entry cooldown | 2h | 1h | 30min |
 | TA / news weight | 60/40 | 65/35 | 70/30 |
+
+The market regime then overlays on the chosen style: neutral adds +3 to the
+entry threshold; risk-off adds +10, halves risk per trade, and reduces max
+positions by 2.
 
 ## Going live (real orders — read this first)
 
@@ -91,10 +121,13 @@ actions taken each cycle.
 | `main.py` | FastAPI app, bot loop, REST API |
 | `market.py` | Kraken public OHLC client + CoinGecko universe discovery |
 | `exchange.py` | Kraken private API client + live order executor |
-| `indicators.py` | RSI / MACD / EMA / Bollinger + composite TA score |
+| `indicators.py` | RSI / MACD / EMA / Bollinger / ADX / StochRSI / volume + composite TA score |
 | `news.py` | RSS scanning + lexicon sentiment |
-| `strategy.py` | Score weighting and signal thresholds |
-| `trader.py` | Paper portfolio engine (SQLite: `cryptopilot.db`) |
+| `strategy.py` | Trading styles, regime overlay, thresholds |
+| `regime.py` | Market regime: BTC trend + breadth |
+| `trader.py` | Portfolio engine, risk sizing, circuit breaker (SQLite: `cryptopilot.db`) |
+| `analytics.py` | Performance statistics from the trade log |
+| `backtest.py` | Strategy replay over stored candle history |
 | `static/` | Dashboard GUI |
 
 ## Notes

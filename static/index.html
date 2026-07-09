@@ -23,6 +23,7 @@
     </div>
     <div class="hstat"><span class="hstat-label">Equity</span><span id="h-equity" class="hstat-value">—</span></div>
     <div class="hstat"><span class="hstat-label">Total P&amp;L</span><span id="h-pnl" class="hstat-value">—</span></div>
+    <div id="regime-pill" class="status-pill regime hidden"><span id="regime-text">—</span></div>
     <div id="status-pill" class="status-pill starting"><span class="dot"></span><span id="status-text">STARTING</span></div>
     <button id="btn-pause" class="btn">Pause</button>
     <button id="btn-mode" class="btn">Go Live</button>
@@ -33,35 +34,6 @@
 <main>
   <div id="loading" class="loading-banner">Bot warming up — fetching market data and headlines (first cycle takes ~15s)…</div>
   <div id="error-banner" class="error-banner hidden"></div>
-
-  <div class="grid grid-2">
-    <section class="card">
-      <div class="card-head"><h2>🧠 Bot Findings</h2><span id="summary-time" class="muted"></span></div>
-      <div id="summary-bias" class="bias-line"></div>
-      <ul id="summary-lines" class="summary-list"></ul>
-    </section>
-
-    <section class="card">
-      <div class="card-head"><h2>💼 Portfolio</h2><canvas id="spark" width="260" height="56"></canvas></div>
-      <div class="port-stats" id="port-stats"></div>
-      <table class="table" id="positions-table">
-        <thead><tr><th>Coin</th><th>Qty</th><th>Entry</th><th>Now</th><th>Value</th><th>P&amp;L</th><th>Stop / Target</th><th></th></tr></thead>
-        <tbody></tbody>
-      </table>
-      <div id="positions-empty" class="empty hidden">No open positions — the bot is waiting for a strong enough signal.</div>
-    </section>
-  </div>
-
-  <section class="card">
-    <div class="card-head"><h2>📡 Signals &amp; Potential Trades</h2><span class="muted">click a row for the chart · TA 65% + news 35%</span></div>
-    <table class="table" id="signals-table">
-      <thead><tr>
-        <th>Coin</th><th>Price</th><th>24h</th><th>Technical</th><th>News</th>
-        <th>Combined</th><th>Signal</th><th>Bot action</th><th>Key factors</th>
-      </tr></thead>
-      <tbody></tbody>
-    </table>
-  </section>
 
   <div class="grid grid-2">
     <section class="card">
@@ -80,6 +52,67 @@
       <div class="scroll-box" id="headlines"></div>
     </section>
   </div>
+
+  <div class="grid grid-2">
+    <section class="card">
+      <div class="card-head"><h2>🧠 Bot Findings</h2><span id="summary-time" class="muted"></span></div>
+      <div id="summary-bias" class="bias-line"></div>
+      <ul id="summary-lines" class="summary-list"></ul>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>💼 Portfolio</h2><canvas id="spark" width="260" height="56"></canvas></div>
+      <div class="port-stats" id="port-stats"></div>
+      <div id="risk-line" class="risk-line"></div>
+      <div id="breaker-banner" class="error-banner hidden"></div>
+      <table class="table" id="positions-table">
+        <thead><tr><th>Coin</th><th>Qty</th><th>Entry</th><th>Now</th><th>Value</th><th>P&amp;L</th><th>Stop / Target</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="positions-empty" class="empty hidden">No open positions — the bot is waiting for a strong enough signal.</div>
+    </section>
+  </div>
+
+  <div class="grid grid-2">
+    <section class="card">
+      <div class="card-head"><h2>📈 Performance</h2><span id="analytics-note" class="muted"></span></div>
+      <div class="port-stats" id="analytics-stats"></div>
+      <div id="analytics-coins" class="muted analytics-coins"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>🧪 Backtest</h2>
+        <span class="bt-controls">
+          <select id="bt-style" class="btn style-select">
+            <option value="conservative">Conservative</option>
+            <option value="balanced">Balanced</option>
+            <option value="aggressive" selected>Aggressive</option>
+          </select>
+          <select id="bt-days" class="btn style-select">
+            <option value="7">7 days</option>
+            <option value="14">14 days</option>
+            <option value="21" selected>21 days</option>
+            <option value="28">28 days</option>
+          </select>
+          <button id="bt-run" class="btn">Run</button>
+        </span>
+      </div>
+      <div id="bt-status" class="muted">Replays the exact strategy over stored history (TA-only — historical news isn't available).</div>
+      <div class="port-stats hidden" id="bt-stats"></div>
+      <canvas id="bt-curve" width="560" height="110" class="hidden"></canvas>
+    </section>
+  </div>
+
+  <section class="card">
+    <div class="card-head"><h2>📡 Signals &amp; Potential Trades</h2><span class="muted">click a row for the chart · TA 65% + news 35%</span></div>
+    <table class="table" id="signals-table">
+      <thead><tr>
+        <th>Coin</th><th>Price</th><th>24h</th><th>Technical</th><th>News</th>
+        <th>Combined</th><th>Signal</th><th>Bot action</th><th>Key factors</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
 
   <footer id="footer-note">
     Paper trading — no real funds are used. Market data: Kraken public API · Headlines: public RSS feeds.
