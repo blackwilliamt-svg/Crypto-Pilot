@@ -15,12 +15,13 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import analytics
 import backtest
 import exchange
+import report
 import indicators
 import market
 import news
@@ -431,6 +432,101 @@ def api_coin(symbol: str):
         "bb_lower": lower[-168:],
         "trades": TRADER.trades_for(symbol, window[0]["t"]),
     }
+
+
+@app.get("/api/position/{symbol}")
+def api_position_detail(symbol: str):
+    """Everything about one open position: the 15m entry-timeframe chart
+    window, entry context, live risk numbers, and a projected sell point."""
+    symbol = symbol.upper()
+    pos = TRADER.positions.get(symbol)
+    if not pos:
+        raise HTTPException(404, "no open position for that symbol")
+    candles = CANDLES_15M.get(symbol, [])
+    if not candles:
+        raise HTTPException(409, "candles not loaded yet for that symbol")
+    pos = dict(pos)  # snapshot; don't hand the live dict to the response
+    price = candles[-1]["c"]
+    entry, stop, target = pos["entry"], pos["stop"], pos["target"]
+    stop0 = pos.get("stop0", stop)
+    atr = indicators.atr(candles)
+    now = time.time()
+    held_hours = (now - pos["opened"]) / 3600.0
+    params = strategy.PARAMS
+
+    # Projected sell point: drift of the last 8 hours of 15m closes, extended
+    # forward until it crosses the target (drifting up), the stop (drifting
+    # down), or the style's time-stop deadline (going sideways).
+    closes = [c["c"] for c in candles[-32:]]
+    n = len(closes)
+    xbar, ybar = (n - 1) / 2.0, sum(closes) / n
+    denom = sum((i - xbar) ** 2 for i in range(n))
+    drift = sum((i - xbar) * (c - ybar) for i, c in enumerate(closes)) / denom if denom else 0.0
+    flat_band = price * 0.0004  # < ~0.04%/bar counts as sideways
+    time_stop_in_h = max(0.0, params["max_hold_hours"] - held_hours)
+    projection = {"basis": "none", "exit_price": None, "eta_hours": None}
+    if drift > flat_band:
+        eta_bars = (target - price) / drift
+        if eta_bars * 0.25 <= 96:  # give up beyond ~4 days out
+            projection = {"basis": "target", "exit_price": target,
+                          "eta_hours": eta_bars * 0.25}
+    elif drift < -flat_band:
+        eta_bars = (price - stop) / -drift
+        if eta_bars * 0.25 <= 96:
+            projection = {"basis": "stop", "exit_price": stop,
+                          "eta_hours": eta_bars * 0.25}
+    elif price < entry * 1.005:
+        projection = {"basis": "time_stop", "exit_price": price,
+                      "eta_hours": time_stop_in_h}
+
+    sig = next((s for s in STATE.get("signals", []) if s["symbol"] == symbol), None)
+    risk_now = pos["qty"] * (price - stop)
+    r_denom = entry - stop0
+    return {
+        "symbol": symbol,
+        "name": UNIVERSE.get(symbol, {}).get("name", symbol),
+        "tf": pos.get("tf", "15m"),
+        "entry": entry, "qty": pos["qty"], "opened": pos["opened"],
+        "reason": pos.get("reason", ""),
+        "price": price, "stop": stop, "stop0": stop0, "target": target,
+        "high": pos["high"], "atr": atr,
+        "pnl": pos["qty"] * (price - entry),
+        "pnl_pct": (price / entry - 1) * 100.0,
+        "peak_pct": (pos["high"] / entry - 1) * 100.0,
+        "held_hours": held_hours,
+        "risk_now": risk_now,                       # $ lost from here if the stop is hit
+        "locked_profit": pos["qty"] * (stop - entry) if stop > entry else 0.0,
+        "r_multiple": (price - entry) / r_denom if r_denom > 0 else None,
+        "dist_to_stop_pct": (stop / price - 1) * 100.0,
+        "dist_to_target_pct": (target / price - 1) * 100.0,
+        "breakeven_armed": stop >= entry * (1 + 0.003),
+        "time_stop_in_hours": time_stop_in_h,
+        "score": sig["total"] if sig else None,
+        "action": sig["action"] if sig else None,
+        "projection": projection,
+        "candles": candles[-192:],                  # last 48h of the 15m entry chart
+    }
+
+
+@app.get("/api/report.pdf")
+def api_report_pdf():
+    prices = _latest_prices()
+    snap = _portfolio_snapshot(prices)
+    positions = snap["positions"]
+    for p in positions:  # enrich with entry context for the report
+        src = TRADER.positions.get(p["symbol"], {})
+        p["tf"] = src.get("tf", "15m")
+        p["reason"] = src.get("reason", "")
+        p["high"] = src.get("high", p["entry"])
+    trades = TRADER.recent_trades(400)
+    stats = analytics.compute(trades, TRADER.equity_history(5000), START_CASH)
+    pdf = report.build(trades, positions, stats, snap["portfolio"], {
+        "mode": MODE, "style": strategy.ACTIVE_STYLE,
+        "regime_name": REGIME.get("name", "?"),
+    })
+    fname = f"cryptopilot-report-{time.strftime('%Y%m%d-%H%M')}.pdf"
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 @app.post("/api/bot/toggle")

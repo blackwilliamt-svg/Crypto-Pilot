@@ -53,6 +53,11 @@ h1 { font-size: 19px; font-weight: 600; letter-spacing: .3px; }
   padding: 6px 2px 2px; border-top: 1px solid var(--border); margin-top: 8px;
 }
 .bt-controls { display: flex; gap: 6px; align-items: center; }
+.pos-row { cursor: pointer; }
+.pos-row:hover td { background: rgba(56,189,248,.05); }
+.tf-tag { font-size: 10px; border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+#pos-chart { width: 100%; height: auto; background: var(--card2); border-radius: 10px; }
+#btn-pdf { padding: 4px 10px; font-size: 12px; text-decoration: none; }
 .analytics-coins { font-size: 12px; margin-top: 8px; }
 #bt-curve { width: 100%; margin-top: 8px; }
 .header-stats { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }

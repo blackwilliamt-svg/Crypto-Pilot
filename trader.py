@@ -159,10 +159,13 @@ class PaperTrader:
                 state = json.loads(row[0])
                 self.cash = state["cash"]
                 self.positions = state["positions"]
-                for pos in self.positions.values():  # backfill if loading a pre-trailing-stop save
+                for pos in self.positions.values():  # backfill if loading an older-format save
                     pos.setdefault("high", pos["entry"])
                     pos.setdefault("stop", pos["entry"] * (1 + strategy.PARAMS["max_stop_pct"]))
                     pos.setdefault("target", pos["entry"] * (1 + MIN_TARGET_PCT))
+                    pos.setdefault("stop0", pos["stop"])
+                    pos.setdefault("tf", "15m")
+                    pos.setdefault("reason", "")
 
     def _save(self):
         blob = json.dumps({"cash": self.cash, "positions": self.positions})
@@ -227,6 +230,10 @@ class PaperTrader:
             self.positions[symbol] = {
                 "qty": qty, "entry": price, "opened": time.time(),
                 "high": price, "stop": stop, "target": target,
+                # entry context, kept for the position-detail view and reports
+                "stop0": stop,          # initial stop — R-multiple baseline
+                "tf": "15m",            # signal timeframe the entry fired on
+                "reason": reason[:220],
             }
             prefix = "[LIVE] " if self.executor is not None else ""
             self.db.execute(

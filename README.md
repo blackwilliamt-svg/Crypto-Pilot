@@ -66,6 +66,21 @@ Each cycle (every 45 seconds), for every coin in the universe:
      signal are closed to free the capital.
    - Positions can always be closed manually from the dashboard.
 
+## Position detail & trade reports
+
+- **Click any open position** for its detail view: the 15m entry-timeframe
+  chart with the entry marker, live stop-loss / take-profit / initial-stop
+  lines, and a **projected sell point** (dashed) extrapolated from the last
+  8 hours of drift — toward the target, the stop, or the time-stop deadline,
+  whichever the current drift reaches first. Chips show hold time, peak gain,
+  R-multiple, and whether breakeven is locked; below the chart: why the bot
+  bought, dollar risk if stopped now, profit already locked in, and the bot's
+  current read on the coin.
+- **Export PDF** (Recent Trades header, or `GET /api/report.pdf`): a trade
+  report with portfolio summary, performance stats, open positions with entry
+  reasoning, and the full recent trade log with per-trade reasoning — handy
+  for reviewing how trades went.
+
 ## Analytics & backtesting
 
 - **Performance panel**: win rate, profit factor, expectancy per trade, max

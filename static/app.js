@@ -101,8 +101,8 @@ function renderPortfolio(st) {
 
   const tbody = $("positions-table").querySelector("tbody");
   tbody.innerHTML = (st.positions || []).map((pos) => `
-    <tr>
-      <td><b>${esc(pos.symbol)}</b></td>
+    <tr class="pos-row" data-pos="${esc(pos.symbol)}" title="Click for the entry chart, stop/target/projection and risk detail">
+      <td><b>${esc(pos.symbol)}</b> <span class="muted tf-tag">15m</span></td>
       <td>${fmtQty(pos.qty)}</td>
       <td>${fmtPrice(pos.entry)}</td>
       <td>${fmtPrice(pos.price)}</td>
@@ -112,7 +112,9 @@ function renderPortfolio(st) {
       <td><button class="btn btn-close" data-close="${esc(pos.symbol)}">Close</button></td>
     </tr>`).join("");
   tbody.querySelectorAll("[data-close]").forEach((btn) =>
-    btn.addEventListener("click", () => closePosition(btn.dataset.close)));
+    btn.addEventListener("click", (e) => { e.stopPropagation(); closePosition(btn.dataset.close); }));
+  tbody.querySelectorAll(".pos-row").forEach((row) =>
+    row.addEventListener("click", () => openPosition(row.dataset.pos)));
   $("positions-empty").classList.toggle("hidden", (st.positions || []).length > 0);
   drawSpark(p.equity_history || [], p.start_cash);
 
@@ -299,6 +301,132 @@ function drawChart(d) {
     ctx.closePath(); ctx.fill();
   });
 }
+
+/* ---------- position detail modal ---------- */
+
+function fmtDur(hours) {
+  if (hours == null) return "—";
+  if (hours < 1) return Math.round(hours * 60) + "m";
+  if (hours < 48) return hours.toFixed(1) + "h";
+  return (hours / 24).toFixed(1) + "d";
+}
+
+async function openPosition(sym) {
+  let d;
+  try {
+    const r = await fetch("/api/position/" + sym);
+    if (!r.ok) return;
+    d = await r.json();
+  } catch { return; }
+
+  $("pos-title").textContent = `${d.name} (${d.symbol}) — entered on the ${d.tf} chart`;
+  const chips = [
+    `Held ${fmtDur(d.held_hours)}`,
+    `P&L ${fmtPct(d.pnl_pct)}`,
+    `Peak ${fmtPct(d.peak_pct)}`,
+    d.r_multiple != null ? `${d.r_multiple.toFixed(2)}R` : null,
+    d.breakeven_armed ? "✓ breakeven locked" : null,
+    d.score != null ? `Signal ${d.score >= 0 ? "+" : ""}${Math.round(d.score)}` : null,
+  ].filter(Boolean);
+  $("pos-chips").innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("");
+
+  const proj = d.projection || {};
+  const projText = {
+    target: `riding the current drift, price reaches the take-profit ${fmtPrice(proj.exit_price)} in ~${fmtDur(proj.eta_hours)}`,
+    stop: `on the current drift, price hits the stop ${fmtPrice(proj.exit_price)} in ~${fmtDur(proj.eta_hours)}`,
+    time_stop: `moving sideways — the ${fmtDur(d.time_stop_in_hours)} time stop will free this capital if nothing changes`,
+    none: "no clear drift — exit will come from the trailing stop, take-profit, or a signal flip",
+  }[proj.basis || "none"];
+
+  $("pos-info").innerHTML = [
+    `Why it was bought: ${esc(d.reason || "n/a")}`,
+    `Projected sell: ${esc(projText)}`,
+    `Stop ${fmtPrice(d.stop)} (${fmtPct(d.dist_to_stop_pct)} away) · initial stop was ${fmtPrice(d.stop0)} · take-profit ${fmtPrice(d.target)} (${fmtPct(d.dist_to_target_pct)} away)`,
+    `Risk if stopped now: ${fmtMoney(d.risk_now, true)}` +
+      (d.locked_profit > 0 ? ` — profit already locked in: ${fmtMoney(d.locked_profit, true)}` : ""),
+    d.action ? `Bot's current read: ${esc(d.action)}` : null,
+  ].filter(Boolean).map((l) => `<li>${l}</li>`).join("");
+
+  $("pos-modal").classList.remove("hidden");
+  drawPositionChart(d);
+}
+
+function drawPositionChart(d) {
+  const cv = $("pos-chart"), ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height, padL = 64, padR = 70, padT = 12, padB = 24;
+  ctx.clearRect(0, 0, W, H);
+
+  const candles = d.candles || [];
+  if (candles.length < 2) return;
+  const closes = candles.map((c) => c.c);
+  const n = closes.length;
+  const projSlots = Math.round(n * 0.18);        // right-hand space for the projection
+  const total = n + projSlots;
+
+  const levels = [d.entry, d.stop, d.stop0, d.target, d.high];
+  if (d.projection && d.projection.exit_price != null) levels.push(d.projection.exit_price);
+  const lows = candles.map((c) => c.l), highs = candles.map((c) => c.h);
+  const min = Math.min(...lows, ...levels), max = Math.max(...highs, ...levels);
+  const pad = (max - min) * 0.06 || 1;
+  const x = (i) => padL + (i / (total - 1)) * (W - padL - padR);
+  const y = (v) => padT + (1 - (v - min + pad) / (max - min + 2 * pad)) * (H - padT - padB);
+
+  // grid + y labels
+  ctx.font = "11px Segoe UI"; ctx.fillStyle = "#8b98ab"; ctx.strokeStyle = "#1a2333"; ctx.lineWidth = 1;
+  for (let g = 0; g <= 4; g++) {
+    const v = min - pad + ((max - min + 2 * pad) * g) / 4, yy = y(v);
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke();
+    ctx.fillText(v >= 100 ? v.toLocaleString("en-US", { maximumFractionDigits: 0 }) : v.toPrecision(4), 6, yy + 4);
+  }
+  for (let g = 0; g <= 3; g++) {
+    const i = Math.round(((n - 1) * g) / 3);
+    const dt = new Date(candles[i].t * 1000);
+    ctx.fillText(dt.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" }), x(i) - 24, H - 6);
+  }
+
+  // horizontal management levels with right-edge labels
+  const hline = (v, color, label, dash = [5, 4]) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.2; ctx.setLineDash(dash);
+    ctx.beginPath(); ctx.moveTo(padL, y(v)); ctx.lineTo(W - padR, y(v)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = color; ctx.font = "10px Segoe UI";
+    ctx.fillText(label, W - padR + 4, y(v) + 3);
+  };
+  hline(d.entry, "#8b98ab", "entry", [2, 3]);
+  if (Math.abs(d.stop0 - d.stop) / d.stop > 0.001) hline(d.stop0, "#7f3a3a", "stop₀", [2, 4]);
+  hline(d.stop, "#f87171", "stop");
+  hline(d.target, "#34d399", "target");
+
+  // price line
+  ctx.strokeStyle = "#38bdf8"; ctx.lineWidth = 1.8; ctx.beginPath();
+  closes.forEach((v, i) => (i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v))));
+  ctx.stroke();
+
+  // entry marker at the bar closest to the open timestamp
+  let ei = 0, best = Infinity;
+  candles.forEach((c, i) => { const dt = Math.abs(c.t - d.opened); if (dt < best) { best = dt; ei = i; } });
+  ctx.fillStyle = "#34d399"; ctx.beginPath();
+  ctx.moveTo(x(ei), y(d.entry) - 12); ctx.lineTo(x(ei) - 6, y(d.entry) - 2); ctx.lineTo(x(ei) + 6, y(d.entry) - 2);
+  ctx.closePath(); ctx.fill();
+
+  // projected sell path into the reserved right-hand space
+  const proj = d.projection || {};
+  if (proj.exit_price != null && proj.basis !== "none") {
+    const lastY = y(closes[n - 1]);
+    ctx.strokeStyle = "#a78bfa"; ctx.lineWidth = 1.6; ctx.setLineDash([6, 5]);
+    ctx.beginPath(); ctx.moveTo(x(n - 1), lastY); ctx.lineTo(x(total - 1), y(proj.exit_price)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#a78bfa";
+    ctx.beginPath(); ctx.arc(x(total - 1), y(proj.exit_price), 4.5, 0, Math.PI * 2); ctx.fill();
+    ctx.font = "10px Segoe UI";
+    ctx.fillText("~" + fmtDur(proj.eta_hours), x(n - 1) + 6, Math.min(lastY, y(proj.exit_price)) - 8);
+  }
+}
+
+$("pos-close").addEventListener("click", () => $("pos-modal").classList.add("hidden"));
+$("pos-modal").addEventListener("click", (e) => {
+  if (e.target === $("pos-modal")) $("pos-modal").classList.add("hidden");
+});
 
 /* ---------- performance analytics ---------- */
 

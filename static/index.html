@@ -37,7 +37,9 @@
 
   <div class="grid grid-2">
     <section class="card">
-      <div class="card-head"><h2>🧾 Recent Trades</h2></div>
+      <div class="card-head"><h2>🧾 Recent Trades</h2>
+        <a id="btn-pdf" class="btn" href="/api/report.pdf" title="Download a PDF trade report (summary, open positions, full trade log with reasoning)">Export PDF</a>
+      </div>
       <div class="scroll-box">
         <table class="table" id="trades-table">
           <thead><tr><th>Time</th><th>Side</th><th>Coin</th><th>Price</th><th>Value</th><th>P&amp;L</th></tr></thead>
@@ -119,6 +121,25 @@
     Signals are experimental and not financial advice.
   </footer>
 </main>
+
+<div id="pos-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2 id="pos-title">—</h2>
+      <div id="pos-chips" class="chips"></div>
+      <button id="pos-close" class="btn">✕</button>
+    </div>
+    <canvas id="pos-chart" width="860" height="360"></canvas>
+    <div class="legend">
+      <span><i class="sw" style="background:#38bdf8"></i>Price (15m)</span>
+      <span><i class="sw" style="background:#8b98ab"></i>Entry</span>
+      <span><i class="sw" style="background:#f87171"></i>Stop loss</span>
+      <span><i class="sw" style="background:#34d399"></i>Take profit</span>
+      <span><i class="sw" style="background:#a78bfa"></i>Projected sell</span>
+    </div>
+    <ul id="pos-info" class="summary-list"></ul>
+  </div>
+</div>
 
 <div id="modal" class="modal hidden">
   <div class="modal-box">
