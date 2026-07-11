@@ -32,7 +32,17 @@ ROOT = Path(__file__).parent
 CYCLE_SECONDS = 45  # aggressive: re-evaluate faster now that the signal runs on 15m candles
 NEWS_REFRESH_SECONDS = 300
 UNIVERSE_REFRESH_SECONDS = 6 * 3600
-CANDLE_HISTORY_LIMIT = 750  # per store: ~8 days of 15m, ~31 days of 1h, ~4 months of 4h
+# Per-interval history caps, sized to what each store is actually used for.
+# Holding more than this is pure memory waste (~150 coins × 4 stores of candle
+# dicts is the process's dominant allocation):
+#   15m  — signal TA: EMA50 warmup (~200) + 24h change (96) → 320 bars
+#   1h   — chart (168) + trend bias/breadth (~60) → 260 bars... except the
+#          top-MAX_COINS coins by market cap, which keep the deep ~31-day
+#          history because they're the only ones the backtester replays
+#   4h/1d — only trend_bias (last ~60 bars) → 90 bars
+CANDLE_LIMITS = {15: 320, 60: 260, 240: 90, 1440: 90}
+DEEP_1H_LIMIT = 750
+DEEP_1H_SYMS: set[str] = set()  # top backtest.MAX_COINS by mcap, set on universe refresh
 
 # The tactical signal runs on 15m candles (refreshed every cycle). The 1h/4h/1d
 # stores provide trend context on progressively slower refresh cadences —
@@ -87,11 +97,13 @@ if TRADER.kv_get("mode") == "live":
 
 
 def _refresh_universe():
-    global UNIVERSE, NEWS_PATTERNS, _last_universe
+    global UNIVERSE, NEWS_PATTERNS, DEEP_1H_SYMS, _last_universe
     fresh = market.discover_universe()
     if fresh:
         UNIVERSE = fresh
         NEWS_PATTERNS = news.build_coin_patterns(UNIVERSE)
+        DEEP_1H_SYMS = set(
+            sorted(UNIVERSE, key=lambda s: -UNIVERSE[s].get("market_cap", 0))[:backtest.MAX_COINS])
         for store in (CANDLES_15M, CANDLES, CANDLES_4H, CANDLES_1D):
             for sym in list(store):
                 if sym not in UNIVERSE:
@@ -115,7 +127,10 @@ def _refresh_candle_store(store: dict[str, list[dict]], interval: int):
                 merged = existing + [r for r in new_rows if r["t"] not in existing_ts]
             else:
                 merged = new_rows
-            store[sym] = merged[-CANDLE_HISTORY_LIMIT:]
+            limit = CANDLE_LIMITS[interval]
+            if interval == 60 and sym in DEEP_1H_SYMS:
+                limit = DEEP_1H_LIMIT
+            store[sym] = merged[-limit:]
         time.sleep(0.25)  # stay well under Kraken's public rate limit
 
 
@@ -234,10 +249,12 @@ def _cycle():
     BREAKER = TRADER.circuit_breaker(TRADER.equity(prices), strategy.PARAMS["daily_max_loss"])
     if not PAUSED:
         with TRADE_LOCK:
-            for s in signals:  # adapt each open position's stop/target to latest price + volatility
+            for s in signals:  # position management: trail, breakeven, ratchet, weak/stale exits
                 sym = s["symbol"]
                 if sym in TRADER.positions:
-                    TRADER.update_trailing(sym, s["price"], atrs.get(sym, 0.0), trend_ok=s["total"] >= 0)
+                    act = TRADER.manage(sym, s["price"], atrs.get(sym, 0.0), s["total"], UNIVERSE.get(sym))
+                    if act:
+                        actions.append(act)
 
             actions.extend(TRADER.check_exits(prices, UNIVERSE))
 

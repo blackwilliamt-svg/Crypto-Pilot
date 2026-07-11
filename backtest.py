@@ -21,10 +21,13 @@ import time
 import analytics
 import indicators
 import strategy
-from trader import FEE_RATE, START_CASH, compute_bracket, compute_spend, trail_stop_target
+from trader import FEE_RATE, START_CASH, assess_position, compute_bracket, compute_spend
 
 WARMUP_BARS = 200      # bars needed before the first tradable signal
 MAX_COINS = 40         # top by market cap — keeps a full run under ~a minute
+MIN_DEEP_BARS = 700    # only coins with deep 1h history qualify (main.py keeps
+                       # the full ~31 days only for the top MAX_COINS by mcap;
+                       # a shallow coin would cap the whole replay window)
 
 JOB: dict = {"status": "idle", "progress": 0.0, "result": None, "error": None}
 _job_lock = threading.Lock()
@@ -41,9 +44,9 @@ def _run(candles_1h, candles_4h, candles_1d, universe, style, days):
     ta_weight = params["ta_weight"]
     buy_thr, sell_thr = params["buy_threshold"], params["sell_threshold"]
 
-    # top coins by market cap that have enough history
+    # top coins by market cap that have deep-enough history
     coins = [s for s, m in sorted(universe.items(), key=lambda kv: -kv[1].get("market_cap", 0))
-             if len(candles_1h.get(s, [])) >= WARMUP_BARS + 24][:MAX_COINS]
+             if len(candles_1h.get(s, [])) >= max(MIN_DEEP_BARS, WARMUP_BARS + 24)][:MAX_COINS]
     if not coins:
         raise RuntimeError("no coins with enough 1h history to backtest")
 
@@ -102,15 +105,17 @@ def _run(candles_1h, candles_4h, candles_1d, universe, style, days):
         if btc_start is None:
             btc_start = prices.get("BTC")
 
-        # trailing updates + bracket exits (same shared code as live)
+        # position management + bracket exits (same shared code as live)
         for sym in list(positions):
             price = prices.get(sym)
             if not price:
                 continue
-            trail_stop_target(positions[sym], price, atrs.get(sym, 0.0),
-                              scores.get(sym, 0) >= 0, params)
             pos = positions[sym]
-            if price <= pos["stop"]:
+            reason = assess_position(pos, price, atrs.get(sym, 0.0),
+                                     scores.get(sym, 0.0), params, ts)
+            if reason:
+                sell(sym, price, ts, reason)
+            elif price <= pos["stop"]:
                 sell(sym, price, ts, "trailing stop")
             elif price >= pos["target"]:
                 sell(sym, price, ts, "take profit")

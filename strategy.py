@@ -19,6 +19,8 @@ STYLES: dict[str, dict] = {
         "atr_stop_mult": 2.5, "atr_target_mult": 3.5,
         "max_stop_pct": -0.06,
         "reentry_cooldown": 7200,
+        "breakeven_trigger": 0.015, "ratchet_trigger": 0.03,
+        "weak_loss_cut": -0.02, "max_hold_hours": 96,
     },
     "balanced": {
         "ta_weight": 0.65, "news_weight": 0.35,
@@ -29,6 +31,8 @@ STYLES: dict[str, dict] = {
         "atr_stop_mult": 2.0, "atr_target_mult": 3.0,
         "max_stop_pct": -0.10,
         "reentry_cooldown": 3600,
+        "breakeven_trigger": 0.02, "ratchet_trigger": 0.04,
+        "weak_loss_cut": -0.025, "max_hold_hours": 60,
     },
     "aggressive": {
         "ta_weight": 0.70, "news_weight": 0.30,
@@ -39,6 +43,8 @@ STYLES: dict[str, dict] = {
         "atr_stop_mult": 1.8, "atr_target_mult": 2.8,
         "max_stop_pct": -0.10,
         "reentry_cooldown": 1800,
+        "breakeven_trigger": 0.025, "ratchet_trigger": 0.05,
+        "weak_loss_cut": -0.03, "max_hold_hours": 36,
     },
 }
 

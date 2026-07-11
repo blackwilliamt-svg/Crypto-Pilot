@@ -48,12 +48,23 @@ Each cycle (every 45 seconds), for every coin in the universe:
 5. **Risk engine**: positions are **equal-risk sized** — each stands to lose
    the same fraction of equity if its initial stop is hit, so volatile coins
    get small positions and calm coins larger ones (capped by a max notional
-   fraction). Stops/targets are ATR-adaptive: the stop trails price upward
-   chandelier-style (only ever tightens), the target extends while the trend
-   holds. A **daily circuit breaker** halts new buys (never exits) if equity
-   drops more than the style's daily loss limit, until the next UTC day.
-   Per-coin re-entry cooldowns prevent churn; positions can always be closed
-   manually from the dashboard.
+   fraction). A **daily circuit breaker** halts new buys (never exits) if
+   equity drops more than the style's daily loss limit, until the next UTC
+   day. Per-coin re-entry cooldowns prevent churn.
+6. **Position management** — every open position is re-assessed each cycle:
+   - *Trailing stop* (chandelier): ATR-sized, strictly monotonic — it only
+     ever moves up, so a price crash triggers it instead of outrunning it.
+   - *Breakeven promotion*: once a trade is up ~2–2.5% (by style) the stop
+     jumps to entry + fees — a winner can no longer round-trip into a loser.
+   - *Profit ratchet*: once the peak gain passes the style's trigger, the
+     stop locks in half of that peak, however wide the coin's ATR is.
+   - *Weakness cut*: a position down ~2–3% whose signal has deteriorated
+     half-way to the sell threshold is closed early — dead capital with
+     negative expectancy isn't ridden all the way to the max stop.
+   - *Time stop*: flat-or-losing positions held past the style's max hold
+     (36h aggressive / 60h balanced / 96h conservative) with no bullish
+     signal are closed to free the capital.
+   - Positions can always be closed manually from the dashboard.
 
 ## Analytics & backtesting
 
@@ -80,6 +91,8 @@ Switchable live from the dashboard header (persisted across restarts):
 | Daily loss breaker | −2% | −3% | −4% |
 | ATR stop / target mult | 2.5× / 3.5× | 2.0× / 3.0× | 1.8× / 2.8× |
 | Max stop distance | −6% | −10% | −10% |
+| Breakeven / ratchet trigger | +1.5% / +3% | +2% / +4% | +2.5% / +5% |
+| Weakness cut / max hold | −2% / 96h | −2.5% / 60h | −3% / 36h |
 | Re-entry cooldown | 2h | 1h | 30min |
 | TA / news weight | 60/40 | 65/35 | 70/30 |
 
@@ -134,6 +147,10 @@ actions taken each cycle.
 
 - Data sources are free public endpoints (Kraken public API, public RSS); if one is
   unreachable the bot degrades gracefully and shows the error in the header.
+- Candle history is capped per timeframe to what each store is actually used
+  for (320×15m, 260×1h, 90×4h, 90×1d per coin — except the top 40 coins by
+  market cap, which keep ~31 days of 1h bars for the backtester), keeping
+  resident memory modest even with ~150 coins tracked.
 - State persists across restarts in `cryptopilot.db` (including trading style and
   paper/live mode); the **Reset** button starts over.
 - This is an experimental trading bot and **not financial advice**. Live mode is

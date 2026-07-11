@@ -59,16 +59,66 @@ def compute_spend(equity: float, cash: float, price: float, stop: float, params:
 def trail_stop_target(pos: dict, price: float, atr: float, trend_ok: bool, params: dict):
     """Chandelier trailing update applied to a position dict in place —
     shared by live trading and the backtester. Stop only tightens; target
-    only extends while the trend holds."""
+    only extends while the trend holds.
+
+    The stop is MONOTONIC — max(old, new) — never lowered. The 1%-below-price
+    ceiling applies only to the candidate, not the held stop: clamping the
+    held stop to the falling price would drag it down 1% under the market
+    every cycle and the stop-loss could never fire."""
     pos["high"] = max(pos["high"], price)
     floor_stop = pos["entry"] * (1 + params["max_stop_pct"])
     candidate_stop = pos["high"] - params["atr_stop_mult"] * atr
     ceiling_stop = price * (1 + MIN_STOP_DIST_PCT)
-    pos["stop"] = min(max(pos["stop"], candidate_stop, floor_stop), ceiling_stop)
+    pos["stop"] = max(pos["stop"], min(max(candidate_stop, floor_stop), ceiling_stop))
     if trend_ok:
         candidate_target = price + params["atr_target_mult"] * atr
         max_target = price * (1 + MAX_TARGET_PCT)
         pos["target"] = min(max(pos["target"], candidate_target), max_target)
+
+
+BREAKEVEN_FLOOR_PCT = 0.004      # breakeven stop sits here: covers round-trip fees + slip
+RATCHET_LOCK_FRACTION = 0.5      # once ratchet triggers, lock this share of the peak gain
+
+
+def assess_position(pos: dict, price: float, atr: float, score: float,
+                    params: dict, now: float) -> str | None:
+    """Per-cycle position management, shared by live trading and the
+    backtester. Mutates the stop in place; returns an exit reason string if
+    the position should be closed now, else None.
+
+    1. Trailing (chandelier) stop/target update.
+    2. Breakeven promotion — once a trade is up breakeven_trigger, the stop
+       moves to entry + fees so a winner can no longer become a loser.
+    3. Profit ratchet — once the PEAK gain exceeds ratchet_trigger, the stop
+       locks in RATCHET_LOCK_FRACTION of that peak, however wide the ATR is.
+    4. Weakness cut — a position down weak_loss_cut whose signal has gone
+       half-way to the sell threshold is dead capital with negative
+       expectancy; cut it instead of riding it to the max stop.
+    5. Time stop — held past max_hold_hours with nothing to show for it and
+       no bullish signal: free the capital.
+    """
+    if atr:
+        trail_stop_target(pos, price, atr, score >= 0, params)
+    entry = pos["entry"]
+    gain = price / entry - 1.0
+    peak_gain = pos["high"] / entry - 1.0
+    ceiling = price * (1 + MIN_STOP_DIST_PCT)
+
+    if gain >= params["breakeven_trigger"]:
+        pos["stop"] = max(pos["stop"], min(entry * (1 + BREAKEVEN_FLOOR_PCT), ceiling))
+    if peak_gain >= params["ratchet_trigger"]:
+        lock = entry * (1 + RATCHET_LOCK_FRACTION * peak_gain)
+        pos["stop"] = max(pos["stop"], min(lock, ceiling))
+
+    if gain <= params["weak_loss_cut"] and score <= params["sell_threshold"] * 0.5:
+        return (f"Cut loser: {gain * 100:+.1f}% and signal weakening ({score:+.0f}) — "
+                f"not waiting for the max stop")
+    held_hours = (now - pos["opened"]) / 3600.0
+    if (held_hours >= params["max_hold_hours"] and gain < 0.005
+            and score < params["buy_threshold"] * 0.5):
+        return (f"Time stop: {held_hours:.0f}h held with {gain * 100:+.1f}% "
+                f"and signal only {score:+.0f} — freeing the capital")
+    return None
 
 
 class PaperTrader:
@@ -254,19 +304,26 @@ class PaperTrader:
         raw = self.kv_get("last_order_error")
         return json.loads(raw) if raw else None
 
-    # ---------- adaptive stops ----------
+    # ---------- adaptive stops / position management ----------
 
-    def update_trailing(self, symbol: str, price: float, atr: float, trend_ok: bool):
-        """Adapt the stop/target to the latest price and volatility. The stop
-        only ever tightens (chandelier exit, locks in gains as price rises);
-        the target only extends further while `trend_ok` (trend still holding),
-        and otherwise freezes rather than pulling back."""
+    def manage(self, symbol: str, price: float, atr: float, score: float,
+               meta: dict | None = None) -> str | None:
+        """Run the per-cycle position-management brain (assess_position) on
+        one position: trail the stop/target, promote to breakeven, ratchet in
+        profits, and exit weak or stale positions. Returns a human-readable
+        action string if it closed the position."""
         with self._lock:
             pos = self.positions.get(symbol)
-            if not pos or not atr:
-                return
-            trail_stop_target(pos, price, atr, trend_ok, strategy.PARAMS)
+            if not pos:
+                return None
+            reason = assess_position(pos, price, atr, score, strategy.PARAMS, time.time())
+            if reason:
+                pnl = self.sell(symbol, price, reason, meta)
+                if pnl is not None:
+                    return f"Closed {symbol} at ${price:,.4f}: {reason} (P&L {pnl:+,.2f} USD)"
+                return None
             self._save()
+            return None
 
     def check_exits(self, prices: dict[str, float], universe: dict[str, dict] | None = None) -> list[str]:
         """Adaptive stop-loss / take-profit sweep. Returns human-readable actions."""
