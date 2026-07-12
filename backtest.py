@@ -21,7 +21,8 @@ import time
 import analytics
 import indicators
 import strategy
-from trader import FEE_RATE, START_CASH, assess_position, compute_bracket, compute_spend
+from trader import (FEE_RATE, START_CASH, assess_position, compute_bracket,
+                    compute_spend, pick_swap_victim)
 
 WARMUP_BARS = 200      # bars needed before the first tradable signal
 MAX_COINS = 40         # top by market cap — keeps a full run under ~a minute
@@ -125,20 +126,14 @@ def _run(candles_1h, candles_4h, candles_1d, universe, style, days):
             if scores.get(sym, 0) <= sell_thr and sym in prices:
                 sell(sym, prices[sym], ts, "bearish signal")
 
-        # entries (best first, throttled like live)
-        opened = 0
-        for sym, sc in sorted(scores.items(), key=lambda kv: -kv[1]):
-            if opened >= 2 or sc < buy_thr or sym in positions:
-                continue
-            if len(positions) >= params["max_positions"] or cash < 200.0:
-                break
-            if ts - last_exit.get(sym, -1e12) < params["reentry_cooldown"]:
-                continue
+        # entries (best first, throttled like live, with one swap per step)
+        def open_position(sym, sc):
+            nonlocal cash
             price = prices[sym]
             stop, target = compute_bracket(price, atrs.get(sym, 0.0), params)
             spend = compute_spend(equity(prices), cash, price, stop, params)
             if spend > cash or spend <= 0:
-                continue
+                return False
             fee = spend * FEE_RATE
             qty = (spend - fee) / price
             cash -= spend
@@ -147,7 +142,30 @@ def _run(candles_1h, candles_4h, candles_1d, universe, style, days):
             trades.append({"ts": ts, "symbol": sym, "side": "BUY", "qty": qty,
                            "price": price, "value": spend, "fee": fee,
                            "pnl": None, "pnl_pct": None, "reason": f"signal {sc:+.0f}"})
-            opened += 1
+            return True
+
+        opened = 0
+        swapped = False
+        for sym, sc in sorted(scores.items(), key=lambda kv: -kv[1]):
+            if opened >= 2 or sc < buy_thr or sym in positions:
+                continue
+            if ts - last_exit.get(sym, -1e12) < params["reentry_cooldown"]:
+                continue
+            if len(positions) < params["max_positions"] and cash >= 200.0:
+                if open_position(sym, sc):
+                    opened += 1
+                continue
+            # capacity-blocked: same rotation rule as live
+            if swapped:
+                continue
+            victim = pick_swap_victim(positions, scores, ts, params)
+            if not victim or sc - victim[1] < params["swap_margin"] or victim[0] not in prices:
+                continue
+            sell(victim[0], prices[victim[0]], ts,
+                 f"swapped out for {sym} ({victim[1]:+.0f} vs {sc:+.0f})")
+            if open_position(sym, sc):
+                opened += 1
+            swapped = True
 
         eq = equity(prices)
         equity_curve.append([ts, eq])

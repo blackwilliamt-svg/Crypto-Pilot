@@ -45,6 +45,13 @@ Each cycle (every 45 seconds), for every coin in the universe:
    max positions — exits are never restricted.
 4. **Combined signal** (−100…+100): crossing the buy threshold opens a position
    (max 2 new entries per cycle), crossing the sell threshold closes one.
+   When the book is full (or cash is exhausted) and a new buy signal appears,
+   the bot considers a **position swap**: if the candidate's signal beats the
+   weakest current holding's by the style's swap margin, it rotates — sells
+   the weakest, buys the stronger setup. Guards against churn: fresh
+   positions can't be swapped out until they've had time to work, at most
+   one swap per cycle, and the sold coin's re-entry cooldown prevents
+   ping-ponging back into it.
 5. **Risk engine**: positions are **equal-risk sized** — each stands to lose
    the same fraction of equity if its initial stop is hit, so volatile coins
    get small positions and calm coins larger ones (capped by a max notional
@@ -108,6 +115,7 @@ Switchable live from the dashboard header (persisted across restarts):
 | Max stop distance | −6% | −10% | −10% |
 | Breakeven / ratchet trigger | +1.5% / +3% | +2% / +4% | +2.5% / +5% |
 | Weakness cut / max hold | −2% / 96h | −2.5% / 60h | −3% / 36h |
+| Swap margin / min hold | +20 pts / 6h | +18 pts / 3h | +15 pts / 1.5h |
 | Re-entry cooldown | 2h | 1h | 30min |
 | TA / news weight | 60/40 | 65/35 | 70/30 |
 

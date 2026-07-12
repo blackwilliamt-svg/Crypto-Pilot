@@ -27,6 +27,7 @@ import market
 import news
 import regime
 import strategy
+import trader as trader_mod
 from trader import PaperTrader, MIN_TRADE_CASH, START_CASH
 
 ROOT = Path(__file__).parent
@@ -268,6 +269,8 @@ def _cycle():
                         actions.append(f"Sold {sym} at ${s['price']:,.2f} on bearish signal (P&L {pnl:+,.2f} USD).")
 
             opened = 0
+            swapped = False
+            scores = {s["symbol"]: s["total"] for s in signals}
             if BREAKER["tripped"]:
                 actions.append(
                     f"Circuit breaker active: down {BREAKER['daily_drawdown_pct']:.1f}% today "
@@ -284,6 +287,39 @@ def _cycle():
                     if TRADER.buy(sym, s["price"], reason[:220], prices, atrs.get(sym, 0.0), UNIVERSE.get(sym)):
                         actions.append(f"Opened {sym} at ${s['price']:,.2f} (signal {s['total']:+.0f}).")
                         opened += 1
+                        continue
+
+                    # Capacity-blocked buy: consider rotating out the weakest
+                    # holding if this candidate is decisively stronger.
+                    # One swap per cycle; the sold coin's re-entry cooldown
+                    # stops swap ping-pong.
+                    if swapped or TRADER.in_cooldown(sym) or sym not in UNIVERSE:
+                        continue
+                    victim = trader_mod.pick_swap_victim(
+                        TRADER.positions, scores, time.time(), strategy.PARAMS)
+                    if not victim:
+                        continue
+                    v_sym, v_score = victim
+                    if s["total"] - v_score < strategy.PARAMS["swap_margin"] or v_sym not in prices:
+                        continue
+                    pnl = TRADER.sell(
+                        v_sym, prices[v_sym],
+                        f"Swapped out for {sym} (signal {v_score:+.0f} vs {s['total']:+.0f})",
+                        UNIVERSE.get(v_sym))
+                    if pnl is None:
+                        continue  # live sell rejected — book untouched, no swap
+                    if TRADER.buy(sym, s["price"], ("[swap in] " + reason)[:220], prices,
+                                  atrs.get(sym, 0.0), UNIVERSE.get(sym)):
+                        actions.append(
+                            f"Swapped {v_sym} → {sym}: closed {v_sym} at ${prices[v_sym]:,.4f} "
+                            f"(P&L {pnl:+,.2f} USD, signal {v_score:+.0f}) for {sym} "
+                            f"(signal {s['total']:+.0f}).")
+                        opened += 1
+                    else:
+                        actions.append(
+                            f"Swap incomplete: closed {v_sym} (P&L {pnl:+,.2f} USD) but the "
+                            f"{sym} buy did not fill — cash freed for next cycle.")
+                    swapped = True
 
     for s in signals:
         sym = s["symbol"]
@@ -295,7 +331,13 @@ def _cycle():
             if BREAKER["tripped"]:
                 s["action"] = "Buy signal — halted (daily loss breaker)"
             elif len(TRADER.positions) >= strategy.PARAMS["max_positions"]:
-                s["action"] = "Buy signal — blocked (max positions)"
+                weakest = trader_mod.pick_swap_victim(
+                    TRADER.positions, {x["symbol"]: x["total"] for x in signals},
+                    time.time(), strategy.PARAMS)
+                if weakest and s["total"] - weakest[1] >= strategy.PARAMS["swap_margin"]:
+                    s["action"] = f"Buy signal — swap candidate (vs {weakest[0]} {weakest[1]:+.0f})"
+                else:
+                    s["action"] = "Buy signal — blocked (max positions)"
             elif TRADER.cash < MIN_TRADE_CASH:
                 s["action"] = "Buy signal — blocked (low cash)"
             elif TRADER.in_cooldown(sym):

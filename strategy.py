@@ -21,6 +21,7 @@ STYLES: dict[str, dict] = {
         "reentry_cooldown": 7200,
         "breakeven_trigger": 0.015, "ratchet_trigger": 0.03,
         "weak_loss_cut": -0.02, "max_hold_hours": 96,
+        "swap_margin": 20.0, "swap_min_hold_hours": 6.0,
     },
     "balanced": {
         "ta_weight": 0.65, "news_weight": 0.35,
@@ -33,6 +34,7 @@ STYLES: dict[str, dict] = {
         "reentry_cooldown": 3600,
         "breakeven_trigger": 0.02, "ratchet_trigger": 0.04,
         "weak_loss_cut": -0.025, "max_hold_hours": 60,
+        "swap_margin": 18.0, "swap_min_hold_hours": 3.0,
     },
     "aggressive": {
         "ta_weight": 0.70, "news_weight": 0.30,
@@ -45,6 +47,7 @@ STYLES: dict[str, dict] = {
         "reentry_cooldown": 1800,
         "breakeven_trigger": 0.025, "ratchet_trigger": 0.05,
         "weak_loss_cut": -0.03, "max_hold_hours": 36,
+        "swap_margin": 15.0, "swap_min_hold_hours": 1.5,
     },
 }
 

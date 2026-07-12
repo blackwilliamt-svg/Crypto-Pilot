@@ -80,6 +80,24 @@ BREAKEVEN_FLOOR_PCT = 0.004      # breakeven stop sits here: covers round-trip f
 RATCHET_LOCK_FRACTION = 0.5      # once ratchet triggers, lock this share of the peak gain
 
 
+def pick_swap_victim(positions: dict[str, dict], scores: dict[str, float],
+                     now: float, params: dict) -> tuple[str, float] | None:
+    """When a buy candidate is blocked by capacity, find the weakest current
+    holding it could replace. Only positions held at least swap_min_hold_hours
+    (fresh entries deserve time to work) with a known current score are
+    eligible. Returns (symbol, score) of the weakest, or None. The caller
+    still has to check the candidate beats it by params['swap_margin'] —
+    swapping on a couple points of score difference is churn, not judgment."""
+    eligible = [
+        (sym, scores[sym]) for sym, pos in positions.items()
+        if sym in scores
+        and (now - pos["opened"]) / 3600.0 >= params["swap_min_hold_hours"]
+    ]
+    if not eligible:
+        return None
+    return min(eligible, key=lambda kv: kv[1])
+
+
 def assess_position(pos: dict, price: float, atr: float, score: float,
                     params: dict, now: float) -> str | None:
     """Per-cycle position management, shared by live trading and the
